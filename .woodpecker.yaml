@@ -1,8 +1,6 @@
 when:
   - event: tag
 
-skip_clone: true
-
 steps:
   - name: test
     image: golang:1.24-alpine3.21
@@ -14,7 +12,7 @@ steps:
       - . /ci/services/${CI_REPO_NAME}.conf
       - sh -c "${TEST_SETUP:-true}"
       - export CGO_ENABLED="${CGO_ENABLED:-0}"
-      - cd ${SRC_PATH} && sh -c "${TEST_CMD}"
+      - sh -c "${TEST_CMD}"
     volumes:
       - /opt/ci:/ci:ro
 
