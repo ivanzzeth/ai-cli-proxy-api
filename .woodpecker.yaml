@@ -1,0 +1,41 @@
+when:
+  - event: tag
+
+skip_clone: true
+
+steps:
+  - name: test
+    image: golang:1.24-alpine3.21
+    environment:
+      GOPROXY: https://goproxy.cn,direct
+      GOPATH: /cache/go
+      GOCACHE: /cache/gobuild
+    commands:
+      - . /ci/services/${CI_REPO_NAME}.conf
+      - sh -c "${TEST_SETUP:-true}"
+      - export CGO_ENABLED="${CGO_ENABLED:-0}"
+      - cd ${SRC_PATH} && sh -c "${TEST_CMD}"
+    volumes:
+      - /opt/ci:/ci:ro
+
+  - name: build-push
+    image: docker:cli
+    environment:
+      DOCKER_API_VERSION: "1.45"
+    commands:
+      - . /ci/services/${CI_REPO_NAME}.conf
+      - . /ci/build.sh ${CI_COMMIT_TAG}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/ci:/ci:ro
+
+  - name: deploy
+    image: alpine/k8s:1.32.3
+    environment:
+      KUBECONFIG_DATA:
+        from_secret: kubeconfig
+    commands:
+      - . /ci/services/${CI_REPO_NAME}.conf
+      - . /ci/deploy.sh ${CI_COMMIT_TAG}
+    volumes:
+      - /opt/ci:/ci:ro
