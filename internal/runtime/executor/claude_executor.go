@@ -170,13 +170,18 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		// Decode gzip-compressed error responses (Anthropic may return gzip-compressed errors)
+		var b []byte
+		if decodedErrBody, errDecode := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding")); errDecode == nil {
+			b, _ = io.ReadAll(decodedErrBody)
+			_ = decodedErrBody.Close()
+		} else {
+			b, _ = io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+		}
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
 		return resp, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
@@ -311,12 +316,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		// Decode gzip-compressed error responses (Anthropic may return gzip-compressed errors)
+		var b []byte
+		if decodedErrBody, errDecode := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding")); errDecode == nil {
+			b, _ = io.ReadAll(decodedErrBody)
+			_ = decodedErrBody.Close()
+		} else {
+			b, _ = io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+		}
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return nil, err
 	}
