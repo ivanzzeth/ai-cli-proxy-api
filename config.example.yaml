@@ -68,7 +68,7 @@ proxy-url: ""
 # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
 force-model-prefix: false
 
-# Number of times to retry a request. Retries will occur if the HTTP response code is 403, 408, 500, 502, 503, or 504.
+# Number of times to retry a request. Retries will occur if the HTTP response code is 403, 408, 500, 502, 503, 504, or 529.
 request-retry: 3
 
 # Maximum wait time in seconds for a cooled-down credential before triggering a retry.

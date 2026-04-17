@@ -93,6 +93,8 @@ type ModelState struct {
 	Quota QuotaState `json:"quota"`
 	// UpdatedAt tracks the last update timestamp for this model state.
 	UpdatedAt time.Time `json:"updated_at"`
+	// TransientBackoffLevel tracks exponential backoff for transient upstream errors (408, 500, 502, 503, 504, 529).
+	TransientBackoffLevel int `json:"transient_backoff_level,omitempty"`
 }
 
 // Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.

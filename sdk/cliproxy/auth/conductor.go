@@ -52,6 +52,9 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+
+	transientBackoffBase = time.Second
+	transientBackoffMax  = 30 * time.Second
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1227,13 +1230,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					suspendReason = "quota"
 					shouldSuspendModel = true
 					setModelQuota = true
-				case 408, 500, 502, 503, 504:
-					if quotaCooldownDisabledForAuth(auth) {
-						state.NextRetryAfter = time.Time{}
+				case 408, 500, 502, 503, 504, 529:
+					cooldown, nextLevel := nextTransientCooldown(state.TransientBackoffLevel, quotaCooldownDisabledForAuth(auth))
+					if cooldown > 0 {
+						state.NextRetryAfter = now.Add(cooldown)
 					} else {
-						next := now.Add(1 * time.Minute)
-						state.NextRetryAfter = next
+						state.NextRetryAfter = time.Time{}
 					}
+					state.TransientBackoffLevel = nextLevel
 				default:
 					state.NextRetryAfter = time.Time{}
 				}
@@ -1290,6 +1294,7 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.NextRetryAfter = time.Time{}
 	state.LastError = nil
 	state.Quota = QuotaState{}
+	state.TransientBackoffLevel = 0
 	state.UpdatedAt = now
 }
 
@@ -1497,12 +1502,12 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
-	case 408, 500, 502, 503, 504:
+	case 408, 500, 502, 503, 504, 529:
 		auth.StatusMessage = "transient upstream error"
 		if quotaCooldownDisabledForAuth(auth) {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(1 * time.Minute)
+			auth.NextRetryAfter = now.Add(transientBackoffBase)
 		}
 	default:
 		if auth.StatusMessage == "" {
@@ -1525,6 +1530,23 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 	}
 	if cooldown >= quotaBackoffMax {
 		return quotaBackoffMax, prevLevel
+	}
+	return cooldown, prevLevel + 1
+}
+
+func nextTransientCooldown(prevLevel int, disableCooling bool) (time.Duration, int) {
+	if prevLevel < 0 {
+		prevLevel = 0
+	}
+	if disableCooling {
+		return 0, prevLevel
+	}
+	cooldown := transientBackoffBase * time.Duration(1<<prevLevel)
+	if cooldown < transientBackoffBase {
+		cooldown = transientBackoffBase
+	}
+	if cooldown >= transientBackoffMax {
+		return transientBackoffMax, prevLevel
 	}
 	return cooldown, prevLevel + 1
 }
