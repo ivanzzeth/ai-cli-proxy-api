@@ -8,6 +8,7 @@ package claude
 import (
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -28,7 +29,12 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 	// Max tokens
 	if maxTokens := root.Get("max_tokens"); maxTokens.Exists() {
-		out, _ = sjson.Set(out, "max_tokens", maxTokens.Int())
+		requested := int(maxTokens.Int())
+		limit := resolveOpenAIMaxCompletionLimit(modelName)
+		if limit > 0 && requested > limit {
+			requested = limit
+		}
+		out, _ = sjson.Set(out, "max_tokens", requested)
 	}
 
 	// Temperature
@@ -67,31 +73,31 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	isUserDefinedTarget := strings.Contains(modelName, "/")
 	if !isUserDefinedTarget {
 		if thinkingConfig := root.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
-		if thinkingType := thinkingConfig.Get("type"); thinkingType.Exists() {
-			switch thinkingType.String() {
-			case "enabled":
-				if budgetTokens := thinkingConfig.Get("budget_tokens"); budgetTokens.Exists() {
-					budget := int(budgetTokens.Int())
-					if effort, ok := thinking.ConvertBudgetToLevel(budget); ok && effort != "" {
+			if thinkingType := thinkingConfig.Get("type"); thinkingType.Exists() {
+				switch thinkingType.String() {
+				case "enabled":
+					if budgetTokens := thinkingConfig.Get("budget_tokens"); budgetTokens.Exists() {
+						budget := int(budgetTokens.Int())
+						if effort, ok := thinking.ConvertBudgetToLevel(budget); ok && effort != "" {
+							out, _ = sjson.Set(out, "reasoning_effort", effort)
+						}
+					} else {
+						// No budget_tokens specified, default to "auto" for enabled thinking
+						if effort, ok := thinking.ConvertBudgetToLevel(-1); ok && effort != "" {
+							out, _ = sjson.Set(out, "reasoning_effort", effort)
+						}
+					}
+				case "adaptive":
+					// Claude adaptive means "enable with max capacity"; keep it as highest level
+					// and let ApplyThinking normalize per target model capability.
+					out, _ = sjson.Set(out, "reasoning_effort", string(thinking.LevelXHigh))
+				case "disabled":
+					if effort, ok := thinking.ConvertBudgetToLevel(0); ok && effort != "" {
 						out, _ = sjson.Set(out, "reasoning_effort", effort)
 					}
-				} else {
-					// No budget_tokens specified, default to "auto" for enabled thinking
-					if effort, ok := thinking.ConvertBudgetToLevel(-1); ok && effort != "" {
-						out, _ = sjson.Set(out, "reasoning_effort", effort)
-					}
-				}
-			case "adaptive":
-				// Claude adaptive means "enable with max capacity"; keep it as highest level
-				// and let ApplyThinking normalize per target model capability.
-				out, _ = sjson.Set(out, "reasoning_effort", string(thinking.LevelXHigh))
-			case "disabled":
-				if effort, ok := thinking.ConvertBudgetToLevel(0); ok && effort != "" {
-					out, _ = sjson.Set(out, "reasoning_effort", effort)
 				}
 			}
 		}
-	}
 	}
 
 	// Process messages and system
@@ -320,6 +326,23 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	}
 
 	return []byte(out)
+}
+
+func resolveOpenAIMaxCompletionLimit(modelName string) int {
+	modelInfo := registry.LookupModelInfo(modelName, "openai-compatibility")
+	if modelInfo == nil {
+		modelInfo = registry.LookupModelInfo(modelName)
+	}
+	if modelInfo == nil {
+		return 0
+	}
+	if modelInfo.MaxCompletionTokens > 0 {
+		return modelInfo.MaxCompletionTokens
+	}
+	if modelInfo.OutputTokenLimit > 0 {
+		return modelInfo.OutputTokenLimit
+	}
+	return 0
 }
 
 func convertClaudeContentPart(part gjson.Result) (string, bool) {
