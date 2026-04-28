@@ -59,8 +59,14 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	// Stream
 	out, _ = sjson.Set(out, "stream", stream)
 
-	// Thinking: Convert Claude thinking.budget_tokens to OpenAI reasoning_effort
-	if thinkingConfig := root.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
+	// Thinking: Convert Claude thinking.budget_tokens to OpenAI reasoning_effort.
+	// For user-defined routed models (for example "bailian/qwen-max"), do not
+	// auto-inject reasoning_effort because many OpenAI-compatible upstreams
+	// interpret this as an aggressive preset that can violate provider-specific
+	// max_tokens ranges.
+	isUserDefinedTarget := strings.Contains(modelName, "/")
+	if !isUserDefinedTarget {
+		if thinkingConfig := root.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
 		if thinkingType := thinkingConfig.Get("type"); thinkingType.Exists() {
 			switch thinkingType.String() {
 			case "enabled":
@@ -85,6 +91,7 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 				}
 			}
 		}
+	}
 	}
 
 	// Process messages and system
