@@ -46,6 +46,24 @@ func TestComputeOpenAICompatModelsHash_NormalizesAndDedups(t *testing.T) {
 	}
 }
 
+func TestComputeOpenAICompatModelsHash_IncludesTokenLimits(t *testing.T) {
+	base := []config.OpenAICompatibilityModel{
+		{Name: "qwen-max", Alias: "qwen-max", MaxCompletionTokens: 8192},
+	}
+	changed := []config.OpenAICompatibilityModel{
+		{Name: "qwen-max", Alias: "qwen-max", MaxCompletionTokens: 32768},
+	}
+
+	h1 := ComputeOpenAICompatModelsHash(base)
+	h2 := ComputeOpenAICompatModelsHash(changed)
+	if h1 == "" || h2 == "" {
+		t.Fatal("expected non-empty hashes")
+	}
+	if h1 == h2 {
+		t.Fatalf("expected hash to change when token limit changes, got %s", h1)
+	}
+}
+
 func TestComputeVertexCompatModelsHash_DifferentInputs(t *testing.T) {
 	models := []config.VertexCompatModel{{Name: "gemini-pro", Alias: "pro"}}
 	hash1 := ComputeVertexCompatModelsHash(models)

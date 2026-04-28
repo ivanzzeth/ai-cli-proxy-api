@@ -470,6 +470,14 @@ type OpenAICompatibilityModel struct {
 
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// MaxCompletionTokens is the provider-specific max output tokens for this model.
+	// Optional; 0 means unknown/unset.
+	MaxCompletionTokens int `yaml:"max-completion-tokens,omitempty" json:"max-completion-tokens,omitempty"`
+
+	// OutputTokenLimit is an alternative output token limit field used by some providers.
+	// Optional; 0 means unknown/unset.
+	OutputTokenLimit int `yaml:"output-token-limit,omitempty" json:"output-token-limit,omitempty"`
 }
 
 func (m OpenAICompatibilityModel) GetName() string  { return m.Name }

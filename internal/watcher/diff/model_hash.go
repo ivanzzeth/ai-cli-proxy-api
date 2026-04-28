@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -20,7 +21,7 @@ func ComputeOpenAICompatModelsHash(models []config.OpenAICompatibilityModel) str
 			if name == "" && alias == "" {
 				continue
 			}
-			out(strings.ToLower(name) + "|" + strings.ToLower(alias))
+			out(strings.ToLower(name) + "|" + strings.ToLower(alias) + "|" + normalizedInt(model.MaxCompletionTokens) + "|" + normalizedInt(model.OutputTokenLimit))
 		}
 	})
 	return hashJoined(keys)
@@ -129,4 +130,11 @@ func hashJoined(keys []string) string {
 	}
 	sum := sha256.Sum256([]byte(strings.Join(keys, "\n")))
 	return hex.EncodeToString(sum[:])
+}
+
+func normalizedInt(v int) string {
+	if v <= 0 {
+		return "0"
+	}
+	return fmt.Sprintf("%d", v)
 }

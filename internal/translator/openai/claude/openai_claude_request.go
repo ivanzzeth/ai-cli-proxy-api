@@ -329,18 +329,30 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 }
 
 func resolveOpenAIMaxCompletionLimit(modelName string) int {
-	modelInfo := registry.LookupModelInfo(modelName, "openai-compatibility")
-	if modelInfo == nil {
-		modelInfo = registry.LookupModelInfo(modelName)
+	modelCandidates := []string{modelName}
+	if cut := strings.LastIndex(modelName, "/"); cut >= 0 && cut+1 < len(modelName) {
+		modelCandidates = append(modelCandidates, modelName[cut+1:])
 	}
-	if modelInfo == nil {
-		return 0
-	}
-	if modelInfo.MaxCompletionTokens > 0 {
-		return modelInfo.MaxCompletionTokens
-	}
-	if modelInfo.OutputTokenLimit > 0 {
-		return modelInfo.OutputTokenLimit
+
+	providers := []string{"openai-compatibility", "openai", ""}
+	for _, candidate := range modelCandidates {
+		for _, provider := range providers {
+			var modelInfo *registry.ModelInfo
+			if provider == "" {
+				modelInfo = registry.LookupModelInfo(candidate)
+			} else {
+				modelInfo = registry.LookupModelInfo(candidate, provider)
+			}
+			if modelInfo == nil {
+				continue
+			}
+			if modelInfo.MaxCompletionTokens > 0 {
+				return modelInfo.MaxCompletionTokens
+			}
+			if modelInfo.OutputTokenLimit > 0 {
+				return modelInfo.OutputTokenLimit
+			}
+		}
 	}
 	return 0
 }

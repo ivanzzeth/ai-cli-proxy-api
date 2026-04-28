@@ -864,13 +864,15 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 							modelID = m.Name
 						}
 						ms = append(ms, &ModelInfo{
-							ID:          modelID,
-							Object:      "model",
-							Created:     time.Now().Unix(),
-							OwnedBy:     compat.Name,
-							Type:        "openai-compatibility",
-							DisplayName: modelID,
-							UserDefined: true,
+							ID:                  modelID,
+							Object:              "model",
+							Created:             time.Now().Unix(),
+							OwnedBy:             compat.Name,
+							Type:                "openai-compatibility",
+							DisplayName:         modelID,
+							UserDefined:         true,
+							MaxCompletionTokens: m.MaxCompletionTokens,
+							OutputTokenLimit:    m.OutputTokenLimit,
 						})
 					}
 					// Register and return

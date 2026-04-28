@@ -45,3 +45,27 @@ func TestConvertClaudeRequestToOpenAI_ClampsMaxTokensByModelCapability(t *testin
 		t.Fatalf("max_tokens should be clamped to model limit 8192, got %d payload=%s", gotMaxTokens, string(got))
 	}
 }
+
+func TestConvertClaudeRequestToOpenAI_ClampsMaxTokensByUnprefixedRegistryMatch(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("test-openai-compat-unprefixed", "openai-compatibility", []*registry.ModelInfo{
+		{
+			ID:                  "qwen-max",
+			UserDefined:         true,
+			MaxCompletionTokens: 8192,
+		},
+	})
+	defer reg.UnregisterClient("test-openai-compat-unprefixed")
+
+	input := []byte(`{
+		"model":"bailian/qwen-max",
+		"max_tokens":32000,
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+
+	got := ConvertClaudeRequestToOpenAI("bailian/qwen-max", input, false)
+	gotMaxTokens := gjson.GetBytes(got, "max_tokens").Int()
+	if gotMaxTokens != 8192 {
+		t.Fatalf("max_tokens should be clamped via unprefixed model capability to 8192, got %d payload=%s", gotMaxTokens, string(got))
+	}
+}
