@@ -408,20 +408,26 @@ func normalizeDeepSeekReasoningContentForThinking(payload []byte) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
-	hasReasoningEffort := gjson.GetBytes(payload, "reasoning_effort").Exists()
-	modelName := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "model").String()))
-	isDeepSeekModel := strings.Contains(modelName, "deepseek")
-	if !hasReasoningEffort && !isDeepSeekModel {
-		return payload
-	}
-
 	messages := gjson.GetBytes(payload, "messages")
 	if !messages.Exists() || !messages.IsArray() {
 		return payload
 	}
 
-	out := payload
+	hasReasoningEffort := gjson.GetBytes(payload, "reasoning_effort").Exists()
+	hasAssistantReasoning := false
 	msgs := messages.Array()
+	for i := range msgs {
+		msg := msgs[i]
+		if msg.Get("role").String() == "assistant" && msg.Get("reasoning_content").Exists() {
+			hasAssistantReasoning = true
+			break
+		}
+	}
+	if !hasReasoningEffort && !hasAssistantReasoning {
+		return payload
+	}
+
+	out := payload
 	for i := range msgs {
 		msg := msgs[i]
 		if msg.Get("role").String() != "assistant" {

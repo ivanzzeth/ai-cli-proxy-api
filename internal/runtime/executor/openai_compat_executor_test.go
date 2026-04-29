@@ -42,20 +42,20 @@ func TestNormalizeDeepSeekReasoningContentForThinking(t *testing.T) {
 		}
 	})
 
-	t.Run("inject for deepseek model even without reasoning_effort", func(t *testing.T) {
+	t.Run("inject when conversation already carries assistant reasoning_content", func(t *testing.T) {
 		in := []byte(`{
-			"model":"deepseek-v4-pro",
 			"messages":[
+				{"role":"assistant","content":"prior","reasoning_content":"trace"},
 				{"role":"assistant","content":"done","tool_calls":[{"id":"call_1","type":"function","function":{"name":"ls","arguments":"{}"}}]}
 			]
 		}`)
 		out := normalizeDeepSeekReasoningContentForThinking(in)
-		if !gjson.GetBytes(out, "messages.0.reasoning_content").Exists() {
-			t.Fatalf("messages.0.reasoning_content should be injected for deepseek model")
+		if !gjson.GetBytes(out, "messages.1.reasoning_content").Exists() {
+			t.Fatalf("messages.1.reasoning_content should be injected when assistant reasoning trace exists")
 		}
 	})
 
-	t.Run("no change when neither reasoning_effort nor deepseek model", func(t *testing.T) {
+	t.Run("no change when neither reasoning_effort nor assistant reasoning trace exists", func(t *testing.T) {
 		in := []byte(`{
 			"model":"gpt-4.1",
 			"messages":[
@@ -64,7 +64,7 @@ func TestNormalizeDeepSeekReasoningContentForThinking(t *testing.T) {
 		}`)
 		out := normalizeDeepSeekReasoningContentForThinking(in)
 		if gjson.GetBytes(out, "messages.0.reasoning_content").Exists() {
-			t.Fatalf("messages.0.reasoning_content should not be injected for non-deepseek without reasoning_effort")
+			t.Fatalf("messages.0.reasoning_content should not be injected without thinking signals")
 		}
 	})
 }
