@@ -432,30 +432,16 @@ func convertClaudeToolResultContent(content gjson.Result) (string, bool) {
 
 	if content.IsArray() {
 		var parts []string
-		contentJSON := []byte(`[]`)
-		hasImagePart := false
 		content.ForEach(func(_, item gjson.Result) bool {
 			switch {
 			case item.Type == gjson.String:
 				text := item.String()
 				parts = append(parts, text)
-				textContent := []byte(`{"type":"text","text":""}`)
-				textContent, _ = sjson.SetBytes(textContent, "text", text)
-				contentJSON, _ = sjson.SetRawBytes(contentJSON, "-1", textContent)
 			case item.IsObject() && item.Get("type").String() == "text":
 				text := item.Get("text").String()
 				parts = append(parts, text)
-				textContent := []byte(`{"type":"text","text":""}`)
-				textContent, _ = sjson.SetBytes(textContent, "text", text)
-				contentJSON, _ = sjson.SetRawBytes(contentJSON, "-1", textContent)
 			case item.IsObject() && item.Get("type").String() == "image":
-				contentItem, ok := convertClaudeContentPart(item)
-				if ok {
-					contentJSON, _ = sjson.SetRawBytes(contentJSON, "-1", []byte(contentItem))
-					hasImagePart = true
-				} else {
-					parts = append(parts, item.Raw)
-				}
+				parts = append(parts, convertClaudeImagePartToText(item))
 			case item.IsObject() && item.Get("text").Exists() && item.Get("text").Type == gjson.String:
 				parts = append(parts, item.Get("text").String())
 			default:
@@ -463,10 +449,6 @@ func convertClaudeToolResultContent(content gjson.Result) (string, bool) {
 			}
 			return true
 		})
-
-		if hasImagePart {
-			return string(contentJSON), true
-		}
 
 		joined := strings.Join(parts, "\n\n")
 		if strings.TrimSpace(joined) != "" {
@@ -477,12 +459,7 @@ func convertClaudeToolResultContent(content gjson.Result) (string, bool) {
 
 	if content.IsObject() {
 		if content.Get("type").String() == "image" {
-			contentItem, ok := convertClaudeContentPart(content)
-			if ok {
-				contentJSON := []byte(`[]`)
-				contentJSON, _ = sjson.SetRawBytes(contentJSON, "-1", []byte(contentItem))
-				return string(contentJSON), true
-			}
+			return convertClaudeImagePartToText(content), false
 		}
 		if text := content.Get("text"); text.Exists() && text.Type == gjson.String {
 			return text.String(), false
@@ -491,4 +468,24 @@ func convertClaudeToolResultContent(content gjson.Result) (string, bool) {
 	}
 
 	return content.Raw, false
+}
+
+func convertClaudeImagePartToText(part gjson.Result) string {
+	if source := part.Get("source"); source.Exists() {
+		switch source.Get("type").String() {
+		case "url":
+			if url := strings.TrimSpace(source.Get("url").String()); url != "" {
+				return "[tool_result image: " + url + "]"
+			}
+		case "base64":
+			if mediaType := strings.TrimSpace(source.Get("media_type").String()); mediaType != "" {
+				return "[tool_result image: " + mediaType + " data]"
+			}
+			return "[tool_result image: base64 data]"
+		}
+	}
+	if url := strings.TrimSpace(part.Get("url").String()); url != "" {
+		return "[tool_result image: " + url + "]"
+	}
+	return "[tool_result image]"
 }

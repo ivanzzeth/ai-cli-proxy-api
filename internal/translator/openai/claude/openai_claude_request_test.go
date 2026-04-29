@@ -530,20 +530,11 @@ func TestConvertClaudeRequestToOpenAI_ToolResultTextAndImageContent(t *testing.T
 	}
 
 	toolContent := messages[1].Get("content")
-	if !toolContent.IsArray() {
-		t.Fatalf("Expected tool content array, got %s", toolContent.Raw)
+	if toolContent.Type != gjson.String {
+		t.Fatalf("Expected tool content string, got %s", toolContent.Raw)
 	}
-	if got := toolContent.Get("0.type").String(); got != "text" {
-		t.Fatalf("Expected first tool content type %q, got %q", "text", got)
-	}
-	if got := toolContent.Get("0.text").String(); got != "tool ok" {
-		t.Fatalf("Expected first tool content text %q, got %q", "tool ok", got)
-	}
-	if got := toolContent.Get("1.type").String(); got != "image_url" {
-		t.Fatalf("Expected second tool content type %q, got %q", "image_url", got)
-	}
-	if got := toolContent.Get("1.image_url.url").String(); got != "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" {
-		t.Fatalf("Unexpected image_url: %q", got)
+	if got := toolContent.String(); got != "tool ok\n\n[tool_result image: image/png data]" {
+		t.Fatalf("Unexpected tool content: %q", got)
 	}
 }
 
@@ -585,14 +576,11 @@ func TestConvertClaudeRequestToOpenAI_ToolResultURLImageOnly(t *testing.T) {
 	}
 
 	toolContent := messages[1].Get("content")
-	if !toolContent.IsArray() {
-		t.Fatalf("Expected tool content array, got %s", toolContent.Raw)
+	if toolContent.Type != gjson.String {
+		t.Fatalf("Expected tool content string, got %s", toolContent.Raw)
 	}
-	if got := toolContent.Get("0.type").String(); got != "image_url" {
-		t.Fatalf("Expected tool content type %q, got %q", "image_url", got)
-	}
-	if got := toolContent.Get("0.image_url.url").String(); got != "https://example.com/tool.png" {
-		t.Fatalf("Unexpected image_url: %q", got)
+	if got := toolContent.String(); got != "[tool_result image: https://example.com/tool.png]" {
+		t.Fatalf("Unexpected tool content: %q", got)
 	}
 }
 
