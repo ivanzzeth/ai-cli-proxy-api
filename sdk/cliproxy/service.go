@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -107,7 +108,6 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewGeminiAuthenticator(),
 		sdkAuth.NewCodexAuthenticator(),
 		sdkAuth.NewClaudeAuthenticator(),
-		sdkAuth.NewQwenAuthenticator(),
 	)
 }
 
@@ -282,14 +282,17 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// IMPORTANT: Update coreManager FIRST, before model registration.
 	// This ensures that configuration changes (proxy_url, prefix, etc.) take effect
 	// immediately for API calls, rather than waiting for model registration to complete.
-	// Model registration may involve network calls (e.g., FetchAntigravityModels) that
-	// could timeout if the new proxy_url is unreachable.
 	op := "register"
 	var err error
 	if existing, ok := s.coreManager.GetByID(auth.ID); ok {
 		auth.CreatedAt = existing.CreatedAt
-		auth.LastRefreshedAt = existing.LastRefreshedAt
-		auth.NextRefreshAfter = existing.NextRefreshAfter
+		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+			auth.LastRefreshedAt = existing.LastRefreshedAt
+			auth.NextRefreshAfter = existing.NextRefreshAfter
+			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+				auth.ModelStates = existing.ModelStates
+			}
+		}
 		op = "update"
 		_, err = s.coreManager.Update(ctx, auth)
 	} else {
@@ -309,6 +312,13 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// This operation may block on network calls, but the auth configuration
 	// is already effective at this point.
 	s.registerModelsForAuth(auth)
+	s.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
+
+	// Refresh the scheduler entry so that the auth's supportedModelSet is rebuilt
+	// from the now-populated global model registry. Without this, newly added auths
+	// have an empty supportedModelSet (because Register/Update upserts into the
+	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
+	s.coreManager.RefreshSchedulerEntry(auth.ID)
 }
 
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
@@ -325,6 +335,10 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 		if _, err := s.coreManager.Update(ctx, existing); err != nil {
 			log.Errorf("failed to disable auth %s: %v", id, err)
 		}
+		if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
+			executor.CloseCodexWebsocketSessionsForAuthID(existing.ID, "auth_removed")
+			s.ensureExecutorsForAuth(existing)
+		}
 	}
 }
 
@@ -333,7 +347,7 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 		return
 	}
 	maxInterval := time.Duration(cfg.MaxRetryInterval) * time.Second
-	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval)
+	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials)
 }
 
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
@@ -357,12 +371,29 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 }
 
 func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
-	if s == nil || a == nil {
+	s.ensureExecutorsForAuthWithMode(a, false)
+}
+
+func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace bool) {
+	if s == nil || s.coreManager == nil || a == nil {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
+		if !forceReplace {
+			existingExecutor, hasExecutor := s.coreManager.Executor("codex")
+			if hasExecutor {
+				_, isCodexAutoExecutor := existingExecutor.(*executor.CodexAutoExecutor)
+				if isCodexAutoExecutor {
+					return
+				}
+			}
+		}
+		s.coreManager.RegisterExecutor(executor.NewCodexAutoExecutor(s.cfg))
 		return
 	}
 	// Skip disabled auth entries when (re)binding executors.
 	// Disabled auths can linger during config reloads (e.g., removed OpenAI-compat entries)
-	// and must not override active provider executors (such as iFlow OAuth accounts).
+	// and must not override active provider executors.
 	if a.Disabled {
 		return
 	}
@@ -392,12 +423,6 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
-	case "codex":
-		s.coreManager.RegisterExecutor(executor.NewCodexExecutor(s.cfg))
-	case "qwen":
-		s.coreManager.RegisterExecutor(executor.NewQwenExecutor(s.cfg))
-	case "iflow":
-		s.coreManager.RegisterExecutor(executor.NewIFlowExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
 	default:
@@ -409,14 +434,32 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 	}
 }
 
+func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey string, models []*ModelInfo) {
+	if a == nil || a.ID == "" {
+		return
+	}
+	if len(models) == 0 {
+		GlobalModelRegistry().UnregisterClient(a.ID)
+		return
+	}
+	GlobalModelRegistry().RegisterClient(a.ID, providerKey, models)
+}
+
 // rebindExecutors refreshes provider executors so they observe the latest configuration.
 func (s *Service) rebindExecutors() {
 	if s == nil || s.coreManager == nil {
 		return
 	}
 	auths := s.coreManager.List()
+	reboundCodex := false
 	for _, auth := range auths {
-		s.ensureExecutorsForAuth(auth)
+		if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			if reboundCodex {
+				continue
+			}
+			reboundCodex = true
+		}
+		s.ensureExecutorsForAuthWithMode(auth, true)
 	}
 }
 
@@ -509,6 +552,44 @@ func (s *Service) Run(ctx context.Context) error {
 		s.hooks.OnBeforeStart(s.cfg)
 	}
 
+	// Register callback for startup and periodic model catalog refresh.
+	// When remote model definitions change, re-register models for affected providers.
+	// This intentionally rebuilds per-auth model availability from the latest catalog
+	// snapshot instead of preserving prior registry suppression state.
+	registry.SetModelRefreshCallback(func(changedProviders []string) {
+		if s == nil || s.coreManager == nil || len(changedProviders) == 0 {
+			return
+		}
+
+		providerSet := make(map[string]bool, len(changedProviders))
+		for _, p := range changedProviders {
+			providerSet[strings.ToLower(strings.TrimSpace(p))] = true
+		}
+
+		auths := s.coreManager.List()
+		refreshed := 0
+		for _, item := range auths {
+			if item == nil || item.ID == "" {
+				continue
+			}
+			auth, ok := s.coreManager.GetByID(item.ID)
+			if !ok || auth == nil || auth.Disabled {
+				continue
+			}
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			if !providerSet[provider] {
+				continue
+			}
+			if s.refreshModelRegistrationForAuth(auth) {
+				refreshed++
+			}
+		}
+
+		if refreshed > 0 {
+			log.Infof("re-registered models for %d auth(s) due to model catalog changes: %v", refreshed, changedProviders)
+		}
+	})
+
 	s.serverErr = make(chan error, 1)
 	go func() {
 		if errStart := s.server.Start(); errStart != nil {
@@ -530,9 +611,13 @@ func (s *Service) Run(ctx context.Context) error {
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
 		previousStrategy := ""
+		var previousSessionAffinity bool
+		var previousSessionAffinityTTL string
 		s.cfgMu.RLock()
 		if s.cfg != nil {
 			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+			previousSessionAffinity = s.cfg.Routing.ClaudeCodeSessionAffinity || s.cfg.Routing.SessionAffinity
+			previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
 		}
 		s.cfgMu.RUnlock()
 
@@ -556,7 +641,15 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		previousStrategy = normalizeStrategy(previousStrategy)
 		nextStrategy = normalizeStrategy(nextStrategy)
-		if s.coreManager != nil && previousStrategy != nextStrategy {
+
+		nextSessionAffinity := newCfg.Routing.ClaudeCodeSessionAffinity || newCfg.Routing.SessionAffinity
+		nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
+
+		selectorChanged := previousStrategy != nextStrategy ||
+			previousSessionAffinity != nextSessionAffinity ||
+			previousSessionAffinityTTL != nextSessionAffinityTTL
+
+		if s.coreManager != nil && selectorChanged {
 			var selector coreauth.Selector
 			switch nextStrategy {
 			case "fill-first":
@@ -564,6 +657,20 @@ func (s *Service) Run(ctx context.Context) error {
 			default:
 				selector = &coreauth.RoundRobinSelector{}
 			}
+
+			if nextSessionAffinity {
+				ttl := time.Hour
+				if ttlStr := strings.TrimSpace(nextSessionAffinityTTL); ttlStr != "" {
+					if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
+						ttl = parsed
+					}
+				}
+				selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+					Fallback: selector,
+					TTL:      ttl,
+				})
+			}
+
 			s.coreManager.SetSelector(selector)
 		}
 
@@ -763,9 +870,12 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "vertex":
 		// Vertex AI Gemini supports the same model identifiers as Gemini.
 		models = registry.GetGeminiVertexModels()
-		if authKind == "apikey" {
-			if entry := s.resolveConfigVertexCompatKey(a); entry != nil && len(entry.Models) > 0 {
+		if entry := s.resolveConfigVertexCompatKey(a); entry != nil {
+			if len(entry.Models) > 0 {
 				models = buildVertexCompatConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
 			}
 		}
 		models = applyExcludedModels(models, excluded)
@@ -776,9 +886,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = registry.GetAIStudioModels()
 		models = applyExcludedModels(models, excluded)
 	case "antigravity":
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		models = executor.FetchAntigravityModels(ctx, a, s.cfg)
-		cancel()
+		models = registry.GetAntigravityModels()
 		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
@@ -792,7 +900,22 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		}
 		models = applyExcludedModels(models, excluded)
 	case "codex":
-		models = registry.GetOpenAIModels()
+		codexPlanType := ""
+		if a.Attributes != nil {
+			codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
+		}
+		switch strings.ToLower(codexPlanType) {
+		case "pro":
+			models = registry.GetCodexProModels()
+		case "plus":
+			models = registry.GetCodexPlusModels()
+		case "team", "business", "go":
+			models = registry.GetCodexTeamModels()
+		case "free":
+			models = registry.GetCodexFreeModels()
+		default:
+			models = registry.GetCodexProModels()
+		}
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildCodexConfigModels(entry)
@@ -801,12 +924,6 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				excluded = entry.ExcludedModels
 			}
 		}
-		models = applyExcludedModels(models, excluded)
-	case "qwen":
-		models = registry.GetQwenModels()
-		models = applyExcludedModels(models, excluded)
-	case "iflow":
-		models = registry.GetIFlowModels()
 		models = applyExcludedModels(models, excluded)
 	case "kimi":
 		models = registry.GetKimiModels()
@@ -852,6 +969,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 			for i := range s.cfg.OpenAICompatibility {
 				compat := &s.cfg.OpenAICompatibility[i]
+				if compat.Disabled {
+					continue
+				}
 				if strings.EqualFold(compat.Name, compatName) {
 					isCompatAuth = true
 					// Convert compatibility models to registry models
@@ -863,6 +983,10 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						if modelID == "" {
 							modelID = m.Name
 						}
+						thinking := m.Thinking
+						if thinking == nil {
+							thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
+						}
 						ms = append(ms, &ModelInfo{
 							ID:                  modelID,
 							Object:              "model",
@@ -873,6 +997,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 							UserDefined:         true,
 							MaxCompletionTokens: m.MaxCompletionTokens,
 							OutputTokenLimit:    m.OutputTokenLimit,
+							Thinking:    thinking,
 						})
 					}
 					// Register and return
@@ -880,7 +1005,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						if providerKey == "" {
 							providerKey = "openai-compatibility"
 						}
-						GlobalModelRegistry().RegisterClient(a.ID, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
+						s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
 					} else {
 						// Ensure stale registrations are cleared when model list becomes empty.
 						GlobalModelRegistry().UnregisterClient(a.ID)
@@ -901,11 +1026,60 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		if key == "" {
 			key = strings.ToLower(strings.TrimSpace(a.Provider))
 		}
-		GlobalModelRegistry().RegisterClient(a.ID, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
+		s.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 		return
 	}
 
 	GlobalModelRegistry().UnregisterClient(a.ID)
+}
+
+// refreshModelRegistrationForAuth re-applies the latest model registration for
+// one auth and reconciles any concurrent auth changes that race with the
+// refresh. Callers are expected to pre-filter provider membership.
+//
+// Re-registration is deliberate: registry cooldown/suspension state is treated
+// as part of the previous registration snapshot and is cleared when the auth is
+// rebound to the refreshed model catalog.
+func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
+	if s == nil || s.coreManager == nil || current == nil || current.ID == "" {
+		return false
+	}
+
+	if !current.Disabled {
+		s.ensureExecutorsForAuth(current)
+	}
+	s.registerModelsForAuth(current)
+	s.coreManager.ReconcileRegistryModelStates(context.Background(), current.ID)
+
+	latest, ok := s.latestAuthForModelRegistration(current.ID)
+	if !ok || latest.Disabled {
+		GlobalModelRegistry().UnregisterClient(current.ID)
+		s.coreManager.RefreshSchedulerEntry(current.ID)
+		return false
+	}
+
+	// Re-apply the latest auth snapshot so concurrent auth updates cannot leave
+	// stale model registrations behind. This may duplicate registration work when
+	// no auth fields changed, but keeps the refresh path simple and correct.
+	s.ensureExecutorsForAuth(latest)
+	s.registerModelsForAuth(latest)
+	s.coreManager.ReconcileRegistryModelStates(context.Background(), latest.ID)
+	s.coreManager.RefreshSchedulerEntry(current.ID)
+	return true
+}
+
+// latestAuthForModelRegistration returns the latest auth snapshot regardless of
+// provider membership. Callers use this after a registration attempt to restore
+// whichever state currently owns the client ID in the global registry.
+func (s *Service) latestAuthForModelRegistration(authID string) (*coreauth.Auth, bool) {
+	if s == nil || s.coreManager == nil || authID == "" {
+		return nil, false
+	}
+	auth, ok := s.coreManager.GetByID(authID)
+	if !ok || auth == nil || auth.ID == "" {
+		return nil, false
+	}
+	return auth, true
 }
 
 func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey {
@@ -1242,7 +1416,7 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return buildConfigModels(entry.Models, "openai", "openai")
+	return registry.WithCodexBuiltins(buildConfigModels(entry.Models, "openai", "openai"))
 }
 
 func rewriteModelInfoName(name, oldID, newID string) string {

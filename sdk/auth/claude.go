@@ -32,8 +32,7 @@ func (a *ClaudeAuthenticator) Provider() string {
 }
 
 func (a *ClaudeAuthenticator) RefreshLead() *time.Duration {
-	d := 4 * time.Hour
-	return &d
+	return new(4 * time.Hour)
 }
 
 func (a *ClaudeAuthenticator) Login(ctx context.Context, cfg *config.Config, opts *LoginOptions) (*coreauth.Auth, error) {
@@ -125,6 +124,9 @@ func (a *ClaudeAuthenticator) Login(ctx context.Context, cfg *config.Config, opt
 		defer manualPromptTimer.Stop()
 	}
 
+	var manualInputCh <-chan string
+	var manualInputErrCh <-chan error
+
 waitForCallback:
 	for {
 		select {
@@ -150,10 +152,11 @@ waitForCallback:
 				return nil, err
 			default:
 			}
-			input, errPrompt := opts.Prompt("Paste the Claude callback URL (or press Enter to keep waiting): ")
-			if errPrompt != nil {
-				return nil, errPrompt
-			}
+			manualInputCh, manualInputErrCh = misc.AsyncPrompt(opts.Prompt, "Paste the Claude callback URL (or press Enter to keep waiting): ")
+			continue
+		case input := <-manualInputCh:
+			manualInputCh = nil
+			manualInputErrCh = nil
 			parsed, errParse := misc.ParseOAuthCallback(input)
 			if errParse != nil {
 				return nil, errParse
@@ -168,6 +171,8 @@ waitForCallback:
 				Error: parsed.Error,
 			}
 			break waitForCallback
+		case errManual := <-manualInputErrCh:
+			return nil, errManual
 		}
 	}
 
