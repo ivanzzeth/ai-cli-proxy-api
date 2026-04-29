@@ -17,6 +17,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -107,6 +108,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
+	translated = normalizeDeepSeekReasoningContentForThinking(translated)
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -204,6 +206,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if err != nil {
 		return nil, err
 	}
+	translated = normalizeDeepSeekReasoningContentForThinking(translated)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -381,6 +384,42 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	}
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	return payload
+}
+
+// normalizeDeepSeekReasoningContentForThinking ensures assistant messages include
+// reasoning_content while OpenAI-compatible reasoning mode is enabled.
+// This satisfies DeepSeek thinking-mode replay validation in multi-turn/tool flows.
+func normalizeDeepSeekReasoningContentForThinking(payload []byte) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	if !gjson.GetBytes(payload, "reasoning_effort").Exists() {
+		return payload
+	}
+
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+
+	out := payload
+	msgs := messages.Array()
+	for i := range msgs {
+		msg := msgs[i]
+		if msg.Get("role").String() != "assistant" {
+			continue
+		}
+		if msg.Get("reasoning_content").Exists() {
+			continue
+		}
+		path := fmt.Sprintf("messages.%d.reasoning_content", i)
+		next, err := sjson.SetBytes(out, path, "")
+		if err != nil {
+			return out
+		}
+		out = next
+	}
+	return out
 }
 
 type statusErr struct {
