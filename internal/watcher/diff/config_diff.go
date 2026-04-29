@@ -54,6 +54,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.RequestRetry != newCfg.RequestRetry {
 		changes = append(changes, fmt.Sprintf("request-retry: %d -> %d", oldCfg.RequestRetry, newCfg.RequestRetry))
 	}
+	if oldCfg.MaxRetryCredentials != newCfg.MaxRetryCredentials {
+		changes = append(changes, fmt.Sprintf("max-retry-credentials: %d -> %d", oldCfg.MaxRetryCredentials, newCfg.MaxRetryCredentials))
+	}
 	if oldCfg.MaxRetryInterval != newCfg.MaxRetryInterval {
 		changes = append(changes, fmt.Sprintf("max-retry-interval: %d -> %d", oldCfg.MaxRetryInterval, newCfg.MaxRetryInterval))
 	}
@@ -76,6 +79,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	}
 	if oldCfg.QuotaExceeded.SwitchPreviewModel != newCfg.QuotaExceeded.SwitchPreviewModel {
 		changes = append(changes, fmt.Sprintf("quota-exceeded.switch-preview-model: %t -> %t", oldCfg.QuotaExceeded.SwitchPreviewModel, newCfg.QuotaExceeded.SwitchPreviewModel))
+	}
+	if oldCfg.QuotaExceeded.AntigravityCredits != newCfg.QuotaExceeded.AntigravityCredits {
+		changes = append(changes, fmt.Sprintf("quota-exceeded.antigravity-credits: %t -> %t", oldCfg.QuotaExceeded.AntigravityCredits, newCfg.QuotaExceeded.AntigravityCredits))
 	}
 
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
@@ -184,6 +190,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
 				changes = append(changes, fmt.Sprintf("codex[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))
 			}
+			if o.Websockets != n.Websockets {
+				changes = append(changes, fmt.Sprintf("codex[%d].websockets: %t -> %t", i, o.Websockets, n.Websockets))
+			}
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("codex[%d].api-key: updated", i))
 			}
@@ -250,6 +259,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.RemoteManagement.DisableControlPanel != newCfg.RemoteManagement.DisableControlPanel {
 		changes = append(changes, fmt.Sprintf("remote-management.disable-control-panel: %t -> %t", oldCfg.RemoteManagement.DisableControlPanel, newCfg.RemoteManagement.DisableControlPanel))
 	}
+	if oldCfg.RemoteManagement.DisableAutoUpdatePanel != newCfg.RemoteManagement.DisableAutoUpdatePanel {
+		changes = append(changes, fmt.Sprintf("remote-management.disable-auto-update-panel: %t -> %t", oldCfg.RemoteManagement.DisableAutoUpdatePanel, newCfg.RemoteManagement.DisableAutoUpdatePanel))
+	}
 	oldPanelRepo := strings.TrimSpace(oldCfg.RemoteManagement.PanelGitHubRepository)
 	newPanelRepo := strings.TrimSpace(newCfg.RemoteManagement.PanelGitHubRepository)
 	if oldPanelRepo != newPanelRepo {
@@ -297,6 +309,11 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			newModels := SummarizeVertexModels(n.Models)
 			if oldModels.hash != newModels.hash {
 				changes = append(changes, fmt.Sprintf("vertex[%d].models: updated (%d -> %d entries)", i, oldModels.count, newModels.count))
+			}
+			oldExcluded := SummarizeExcludedModels(o.ExcludedModels)
+			newExcluded := SummarizeExcludedModels(n.ExcludedModels)
+			if oldExcluded.hash != newExcluded.hash {
+				changes = append(changes, fmt.Sprintf("vertex[%d].excluded-models: updated (%d -> %d entries)", i, oldExcluded.count, newExcluded.count))
 			}
 			if !equalStringMap(o.Headers, n.Headers) {
 				changes = append(changes, fmt.Sprintf("vertex[%d].headers: updated", i))
