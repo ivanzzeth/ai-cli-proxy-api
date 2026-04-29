@@ -42,15 +42,29 @@ func TestNormalizeDeepSeekReasoningContentForThinking(t *testing.T) {
 		}
 	})
 
-	t.Run("no change when no reasoning_effort", func(t *testing.T) {
+	t.Run("inject for deepseek model even without reasoning_effort", func(t *testing.T) {
 		in := []byte(`{
+			"model":"deepseek-v4-pro",
+			"messages":[
+				{"role":"assistant","content":"done","tool_calls":[{"id":"call_1","type":"function","function":{"name":"ls","arguments":"{}"}}]}
+			]
+		}`)
+		out := normalizeDeepSeekReasoningContentForThinking(in)
+		if !gjson.GetBytes(out, "messages.0.reasoning_content").Exists() {
+			t.Fatalf("messages.0.reasoning_content should be injected for deepseek model")
+		}
+	})
+
+	t.Run("no change when neither reasoning_effort nor deepseek model", func(t *testing.T) {
+		in := []byte(`{
+			"model":"gpt-4.1",
 			"messages":[
 				{"role":"assistant","content":"done","tool_calls":[{"id":"call_1","type":"function","function":{"name":"ls","arguments":"{}"}}]}
 			]
 		}`)
 		out := normalizeDeepSeekReasoningContentForThinking(in)
 		if gjson.GetBytes(out, "messages.0.reasoning_content").Exists() {
-			t.Fatalf("messages.0.reasoning_content should not be injected without reasoning_effort")
+			t.Fatalf("messages.0.reasoning_content should not be injected for non-deepseek without reasoning_effort")
 		}
 	})
 }

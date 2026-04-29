@@ -408,7 +408,10 @@ func normalizeDeepSeekReasoningContentForThinking(payload []byte) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
-	if !gjson.GetBytes(payload, "reasoning_effort").Exists() {
+	hasReasoningEffort := gjson.GetBytes(payload, "reasoning_effort").Exists()
+	modelName := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "model").String()))
+	isDeepSeekModel := strings.Contains(modelName, "deepseek")
+	if !hasReasoningEffort && !isDeepSeekModel {
 		return payload
 	}
 
