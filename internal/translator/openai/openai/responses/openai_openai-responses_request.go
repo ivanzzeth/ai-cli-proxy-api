@@ -72,6 +72,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 				message := []byte(`{"role":"","content":[]}`)
 				message, _ = sjson.SetBytes(message, "role", role)
+				if reasoningContent := item.Get("reasoning_content"); reasoningContent.Exists() {
+					message, _ = sjson.SetBytes(message, "reasoning_content", reasoningContent.String())
+				}
 
 				if content := item.Get("content"); content.Exists() && content.IsArray() {
 					var messageContent string
@@ -114,6 +117,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			case "function_call":
 				// Handle function call conversion to assistant message with tool_calls
 				assistantMessage := []byte(`{"role":"assistant","tool_calls":[]}`)
+				if reasoningContent := item.Get("reasoning_content"); reasoningContent.Exists() {
+					assistantMessage, _ = sjson.SetBytes(assistantMessage, "reasoning_content", reasoningContent.String())
+				}
 
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 
@@ -145,6 +151,20 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 				out, _ = sjson.SetRawBytes(out, "messages.-1", toolMessage)
+			case "reasoning":
+				// Preserve historical reasoning traces so thinking-mode providers can replay them.
+				reasoningText := item.Get("reasoning_content").String()
+				if reasoningText == "" {
+					reasoningText = item.Get("summary.0.text").String()
+				}
+				if reasoningText == "" {
+					reasoningText = item.Get("encrypted_content").String()
+				}
+				if reasoningText != "" {
+					reasoningMessage := []byte(`{"role":"assistant","content":"","reasoning_content":""}`)
+					reasoningMessage, _ = sjson.SetBytes(reasoningMessage, "reasoning_content", reasoningText)
+					out, _ = sjson.SetRawBytes(out, "messages.-1", reasoningMessage)
+				}
 			}
 
 			return true
