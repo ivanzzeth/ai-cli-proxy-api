@@ -6,12 +6,41 @@ package config
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// OAuthOnlyFields records v8 provider settings that must wait for credential
+	// selection and must not affect API-key credentials. Config YAML snapshots
+	// preserve the corresponding v8 paths instead of serializing this metadata.
+	OAuthOnlyFields map[string]bool `yaml:"-" json:"-"`
+
+	// CodexResponseSteering mirrors the provider-wide runtime setting for API handlers.
+	CodexResponseSteering bool `yaml:"-" json:"-"`
+
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
-	// EnableGeminiCLIEndpoint controls whether Gemini CLI internal endpoints (/v1internal:*) are enabled.
-	// Default is false for safety; when false, /v1internal:* requests are rejected.
-	EnableGeminiCLIEndpoint bool `yaml:"enable-gemini-cli-endpoint" json:"enable-gemini-cli-endpoint"`
+	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
+	//
+	// Supported values:
+	//   - false (default): image_generation is enabled everywhere (normal behavior).
+	//   - true: image_generation is disabled everywhere. The server stops injecting it, removes it from request payloads,
+	//     and returns 404 for /v1/images/generations and /v1/images/edits.
+	//   - "chat": disable image_generation injection for all non-images endpoints (e.g. /v1/responses, /v1/chat/completions),
+	//     while keeping /v1/images/generations and /v1/images/edits enabled and preserving image_generation there.
+	//   - "passthrough": do not modify the tool list on non-images endpoints — keep image_generation if the client
+	//     sent it and do not inject it otherwise; on /v1/images/generations and /v1/images/edits behave like "chat".
+	DisableImageGeneration DisableImageGenerationMode `yaml:"disable-image-generation" json:"disable-image-generation"`
+
+	// GPTImage2BaseModel sets the base (mainline) model used by the legacy hosted
+	// image_generation tool path when a Codex image request is not proxied directly
+	// through the Image API.
+	//
+	// The value must start with "gpt-" (case-insensitive). If empty or invalid, the
+	// default base model ("gpt-5.4-mini") is used.
+	GPTImage2BaseModel string `yaml:"gpt-image-2-base-model,omitempty" json:"gpt-image-2-base-model,omitempty"`
+
+	// VideoResultAuthCacheTTL controls how long video IDs stay pinned to the credential
+	// that created them. Accepts duration strings like "30m" or "3h".
+	// Empty or invalid values use the default 3h.
+	VideoResultAuthCacheTTL string `yaml:"video-result-auth-cache-ttl,omitempty" json:"video-result-auth-cache-ttl,omitempty"`
 
 	// ForceModelPrefix requires explicit model prefixes (e.g., "teamA/gemini-3-pro-preview")
 	// to target prefixed credentials. When false, unprefixed model requests may use prefixed
@@ -20,6 +49,15 @@ type SDKConfig struct {
 
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
+
+	// CodexOptimizeMultiAgentV2 mirrors the provider-wide runtime setting for API handlers.
+	CodexOptimizeMultiAgentV2 bool `yaml:"-" json:"-"`
+
+	// CodexOrphanDelegationCompatibility mirrors the provider-wide runtime setting for API handlers.
+	CodexOrphanDelegationCompatibility bool `yaml:"-" json:"-"`
+
+	// ClaudeCode configures Claude Code compatibility behavior.
+	ClaudeCode ClaudeCodeConfig `yaml:"claude-code" json:"claude-code"`
 
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
@@ -36,9 +74,16 @@ type SDKConfig struct {
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
 }
 
+// ClaudeCodeConfig configures Claude Code compatibility behavior.
+type ClaudeCodeConfig struct {
+	// DisableCloakingModelList disables model ID cloaking in Anthropic model list responses.
+	DisableCloakingModelList bool `yaml:"disable-cloaking-model-list" json:"disable-cloaking-model-list"`
+}
+
 // StreamingConfig holds server streaming behavior configuration.
 type StreamingConfig struct {
-	// KeepAliveSeconds controls how often the server emits SSE heartbeats (": keep-alive\n\n").
+	// KeepAliveSeconds controls how often the server emits SSE heartbeats (": keep-alive\n\n")
+	// or WebSocket Ping control frames.
 	// <= 0 disables keep-alives. Default is 0.
 	KeepAliveSeconds int `yaml:"keepalive-seconds,omitempty" json:"keepalive-seconds,omitempty"`
 

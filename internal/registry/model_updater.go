@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -67,7 +68,7 @@ func SetModelRefreshCallback(cb ModelRefreshCallback) {
 func init() {
 	// Load embedded data as fallback on startup.
 	if err := loadModelsFromBytes(embeddedModelsJSON, "embed"); err != nil {
-		panic(fmt.Sprintf("registry: failed to parse embedded models.json: %v", err))
+		log.Warnf("registry: failed to parse embedded models.json (embedded catalog may be incomplete or invalid; continuing startup and will rely on remote model refresh): %v", err)
 	}
 }
 
@@ -119,6 +120,10 @@ func tryRefreshModels(ctx context.Context, label string) {
 	if parsed == nil {
 		log.Warnf("%s: fetch failed from all URLs, keeping current data", label)
 		return
+	}
+
+	if len(parsed.Meta) == 0 && oldData != nil && len(oldData.Meta) > 0 {
+		parsed.Meta = oldData.Meta
 	}
 
 	// Detect changes before updating store.
@@ -190,8 +195,8 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 }
 
 // detectChangedProviders compares two model catalogs and returns provider names
-// whose model definitions differ. Codex tiers (free/team/plus/pro) are grouped
-// under a single "codex" provider.
+// whose model definitions differ. Gemini changes affect both Gemini protocols,
+// while Codex tiers (free/team/plus/pro) are grouped under one "codex" provider.
 func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 	if oldData == nil || newData == nil {
 		return nil
@@ -206,15 +211,21 @@ func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 	sections := []section{
 		{"claude", oldData.Claude, newData.Claude},
 		{"gemini", oldData.Gemini, newData.Gemini},
+		{"gemini-interactions", oldData.Gemini, newData.Gemini},
 		{"vertex", oldData.Vertex, newData.Vertex},
-		{"gemini-cli", oldData.GeminiCLI, newData.GeminiCLI},
 		{"aistudio", oldData.AIStudio, newData.AIStudio},
 		{"codex", oldData.CodexFree, newData.CodexFree},
 		{"codex", oldData.CodexTeam, newData.CodexTeam},
 		{"codex", oldData.CodexPlus, newData.CodexPlus},
 		{"codex", oldData.CodexPro, newData.CodexPro},
 		{"kimi", oldData.Kimi, newData.Kimi},
+		{"kimi-ai", oldData.Kimi, newData.Kimi},
+		{"kimi.ai", oldData.Kimi, newData.Kimi},
+		{"kimi.com", oldData.Kimi, newData.Kimi},
 		{"antigravity", oldData.Antigravity, newData.Antigravity},
+		{"xai", oldData.XAI, newData.XAI},
+		{"devin", oldData.Devin, newData.Devin},
+		{"meta", oldData.Meta, newData.Meta},
 	}
 
 	seen := make(map[string]bool, len(sections))
@@ -231,13 +242,21 @@ func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 	return changed
 }
 
-// modelSectionChanged reports whether two model slices differ.
+// modelSectionChanged reports whether two model slices differ, including
+// internal metadata that is intentionally omitted from normal JSON responses.
 func modelSectionChanged(a, b []*ModelInfo) bool {
 	if len(a) != len(b) {
 		return true
 	}
 	if len(a) == 0 {
 		return false
+	}
+	for i := range a {
+		if a[i] != nil && b[i] != nil {
+			if !reflect.DeepEqual(a[i].NativeCapabilities, b[i].NativeCapabilities) || a[i].SupportConfigurationUpdate != b[i].SupportConfigurationUpdate {
+				return true
+			}
+		}
 	}
 	aj, err1 := json.Marshal(a)
 	bj, err2 := json.Marshal(b)
@@ -327,7 +346,6 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 		{name: "claude", models: data.Claude},
 		{name: "gemini", models: data.Gemini},
 		{name: "vertex", models: data.Vertex},
-		{name: "gemini-cli", models: data.GeminiCLI},
 		{name: "aistudio", models: data.AIStudio},
 		{name: "codex-free", models: data.CodexFree},
 		{name: "codex-team", models: data.CodexTeam},
@@ -335,6 +353,8 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 		{name: "codex-pro", models: data.CodexPro},
 		{name: "kimi", models: data.Kimi},
 		{name: "antigravity", models: data.Antigravity},
+		{name: "xai", models: data.XAI},
+		{name: "meta", models: data.Meta},
 	}
 
 	for _, section := range requiredSections {
@@ -347,7 +367,8 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 
 func validateModelSection(section string, models []*ModelInfo) error {
 	if len(models) == 0 {
-		return fmt.Errorf("%s section is empty", section)
+		log.Warnf("models catalog: %s section is empty, continuing without those model definitions", section)
+		return nil
 	}
 
 	seen := make(map[string]struct{}, len(models))

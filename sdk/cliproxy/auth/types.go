@@ -3,16 +3,18 @@ package auth
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	baseauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
+	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
 )
 
 // PostAuthHook defines a function that is called after an Auth record is created
@@ -46,6 +48,10 @@ func GetRequestInfo(ctx context.Context) *RequestInfo {
 type Auth struct {
 	// ID uniquely identifies the auth record across restarts.
 	ID string `json:"id"`
+	// RegistrationEpoch tracks monotonic registration cycles across unregister/re-register.
+	RegistrationEpoch uint64 `json:"registration_epoch,omitempty"`
+	// Generation tracks monotonic mutations to resolve scheduler/reconcile snapshot races.
+	Generation uint64 `json:"generation,omitempty"`
 	// Index is a stable runtime identifier derived from auth metadata (not persisted).
 	Index string `json:"-"`
 	// Provider is the upstream provider key (e.g. "gemini", "claude").
@@ -84,6 +90,8 @@ type Auth struct {
 	LastRefreshedAt time.Time `json:"last_refreshed_at"`
 	// NextRefreshAfter is the earliest time a refresh should retrigger.
 	NextRefreshAfter time.Time `json:"next_refresh_after"`
+	// RefreshFailures tracks consecutive refresh failures for exponential backoff (in-memory only).
+	RefreshFailures int `json:"-"`
 	// NextRetryAfter is the earliest time a retry should retrigger.
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
@@ -92,7 +100,75 @@ type Auth struct {
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
-	indexAssigned bool `json:"-"`
+	Success int64 `json:"-"`
+	Failed  int64 `json:"-"`
+
+	recentRequests recentRequestRing `json:"-"`
+	indexAssigned  bool              `json:"-"`
+}
+
+const (
+	AttributeAuthIndexSeed   = "auth_index_seed"
+	AttributePluginVirtual   = "plugin_virtual"
+	AttributeVirtualSource   = "virtual_source"
+	pluginVirtualAttrEnabled = "true"
+)
+
+// MarkPluginVirtualAuth marks an auth that was expanded from a plugin-owned source file.
+func MarkPluginVirtualAuth(auth *Auth, sourcePath string, ordinal int) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes[AttributePluginVirtual] = pluginVirtualAttrEnabled
+	sourcePath = strings.TrimSpace(sourcePath)
+	if sourcePath != "" {
+		auth.Attributes[AttributeVirtualSource] = sourcePath
+	}
+	seedID := strings.TrimSpace(auth.ID)
+	if seedID == "" {
+		seedID = strings.TrimSpace(auth.FileName)
+	}
+	if seedID == "" {
+		seedID = strconv.Itoa(ordinal)
+	}
+	auth.Attributes[AttributeAuthIndexSeed] = strings.Join([]string{
+		strings.ToLower(strings.TrimSpace(auth.Provider)),
+		sourcePath,
+		seedID,
+		strconv.Itoa(ordinal),
+	}, "|")
+}
+
+// IsPluginVirtualAuth reports whether an auth was expanded from a plugin-owned source file.
+func IsPluginVirtualAuth(auth *Auth) bool {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Attributes[AttributePluginVirtual]), pluginVirtualAttrEnabled)
+}
+
+const (
+	recentRequestBucketSeconds int64 = 10 * 60
+	recentRequestBucketCount         = 20
+)
+
+type recentRequestBucket struct {
+	bucketID int64
+	success  int64
+	failed   int64
+}
+
+type recentRequestRing struct {
+	buckets [recentRequestBucketCount]recentRequestBucket
+}
+
+type RecentRequestBucket struct {
+	Time    string `json:"time"`
+	Success int64  `json:"success"`
+	Failed  int64  `json:"failed"`
 }
 
 // QuotaState contains limiter tracking data for a credential.
@@ -105,6 +181,27 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+	// ObservedAt is the time the current Signals snapshot was observed.
+	ObservedAt time.Time `json:"observed_at,omitempty"`
+	// Signals stores bounded, provider-specific quota watermark values observed
+	// from upstream response headers or websocket quota events. It is a snapshot
+	// of one upstream response, not an accumulation across responses, so an
+	// expired watermark cannot linger after the response that produced it.
+	// Cooldown transitions must use applyCooldownFields so they cannot replace
+	// this snapshot.
+	Signals map[string]string `json:"signals,omitempty"`
+}
+
+// Clone returns an independent copy of the quota state.
+func (q QuotaState) Clone() QuotaState {
+	copyQuota := q
+	if len(q.Signals) > 0 {
+		copyQuota.Signals = make(map[string]string, len(q.Signals))
+		for key, value := range q.Signals {
+			copyQuota.Signals[key] = value
+		}
+	}
+	return copyQuota
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.
@@ -127,12 +224,77 @@ type ModelState struct {
 	TransientBackoffLevel int `json:"transient_backoff_level,omitempty"`
 }
 
+func recentRequestBucketID(now time.Time) int64 {
+	if now.IsZero() {
+		return 0
+	}
+	return now.Unix() / recentRequestBucketSeconds
+}
+
+func recentRequestBucketIndex(bucketID int64) int {
+	mod := bucketID % int64(recentRequestBucketCount)
+	if mod < 0 {
+		mod += int64(recentRequestBucketCount)
+	}
+	return int(mod)
+}
+
+func formatRecentRequestBucketLabel(bucketID int64) string {
+	start := time.Unix(bucketID*recentRequestBucketSeconds, 0).In(time.Local)
+	end := start.Add(time.Duration(recentRequestBucketSeconds) * time.Second)
+	return start.Format("15:04") + "-" + end.Format("15:04")
+}
+
+func (a *Auth) recordRecentRequest(now time.Time, success bool) {
+	if a == nil {
+		return
+	}
+	bucketID := recentRequestBucketID(now)
+	idx := recentRequestBucketIndex(bucketID)
+	bucket := &a.recentRequests.buckets[idx]
+	if bucket.bucketID != bucketID {
+		bucket.bucketID = bucketID
+		bucket.success = 0
+		bucket.failed = 0
+	}
+	if success {
+		bucket.success++
+		return
+	}
+	bucket.failed++
+}
+
+func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
+	out := make([]RecentRequestBucket, 0, recentRequestBucketCount)
+	if a == nil {
+		return out
+	}
+
+	currentBucketID := recentRequestBucketID(now)
+	for i := recentRequestBucketCount - 1; i >= 0; i-- {
+		bucketID := currentBucketID - int64(i)
+		idx := recentRequestBucketIndex(bucketID)
+		bucket := a.recentRequests.buckets[idx]
+		entry := RecentRequestBucket{
+			Time: formatRecentRequestBucketLabel(bucketID),
+		}
+		if bucket.bucketID == bucketID {
+			entry.Success = bucket.success
+			entry.Failed = bucket.failed
+		}
+		out = append(out, entry)
+	}
+
+	return out
+}
+
 // Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.
 func (a *Auth) Clone() *Auth {
 	if a == nil {
 		return nil
 	}
 	copyAuth := *a
+	copyAuth.Quota = a.Quota.Clone()
 	if len(a.Attributes) > 0 {
 		copyAuth.Attributes = make(map[string]string, len(a.Attributes))
 		for key, value := range a.Attributes {
@@ -169,45 +331,77 @@ func (a *Auth) indexSeed() string {
 		return ""
 	}
 
-	if fileName := strings.TrimSpace(a.FileName); fileName != "" {
-		return "file:" + fileName
+	if a.Attributes != nil {
+		if seed := strings.TrimSpace(a.Attributes[AttributeAuthIndexSeed]); seed != "" {
+			return AttributeAuthIndexSeed + ":" + seed
+		}
 	}
 
-	providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
+	provider := strings.ToLower(strings.TrimSpace(a.Provider))
 	compatName := ""
 	baseURL := ""
 	apiKey := ""
-	source := ""
+	filePath := ""
 	if a.Attributes != nil {
-		if value := strings.TrimSpace(a.Attributes["provider_key"]); value != "" {
-			providerKey = strings.ToLower(value)
-		}
-		compatName = strings.ToLower(strings.TrimSpace(a.Attributes["compat_name"]))
+		compatName = strings.TrimSpace(a.Attributes["compat_name"])
 		baseURL = strings.TrimSpace(a.Attributes["base_url"])
 		apiKey = strings.TrimSpace(a.Attributes["api_key"])
-		source = strings.TrimSpace(a.Attributes["source"])
+		filePath = strings.TrimSpace(a.Attributes["path"])
+		if filePath == "" {
+			filePath = strings.TrimSpace(a.Attributes["source"])
+		}
 	}
 
-	proxyURL := strings.TrimSpace(a.ProxyURL)
-	hasCredentialIdentity := compatName != "" || baseURL != "" || proxyURL != "" || apiKey != "" || source != ""
-	if providerKey != "" && hasCredentialIdentity {
-		parts := []string{"provider=" + providerKey}
-		if compatName != "" {
-			parts = append(parts, "compat="+compatName)
+	if filePath == "" {
+		filePath = strings.TrimSpace(a.FileName)
+	}
+	if filePath == "" {
+		filePath = strings.TrimSpace(a.ID)
+	}
+
+	if filePath != "" && strings.HasSuffix(strings.ToLower(filePath), ".json") {
+		abs, errAbs := filepath.Abs(filePath)
+		if errAbs == nil && strings.TrimSpace(abs) != "" {
+			filePath = abs
 		}
-		if baseURL != "" {
-			parts = append(parts, "base="+baseURL)
+		filePath = filepath.Clean(filePath)
+
+		authType := ""
+		if a.Metadata != nil {
+			if rawType, ok := a.Metadata["type"].(string); ok {
+				authType = strings.TrimSpace(rawType)
+			}
 		}
-		if proxyURL != "" {
-			parts = append(parts, "proxy="+proxyURL)
+		if authType == "" {
+			authType = strings.TrimSpace(provider)
 		}
-		if apiKey != "" {
-			parts = append(parts, "api_key="+apiKey)
+		authType = strings.ToLower(strings.TrimSpace(authType))
+		if authType != "" {
+			return authType + ":" + filePath
 		}
-		if source != "" {
-			parts = append(parts, "source="+source)
+	}
+
+	apiPrefix := ""
+	if apiKey != "" {
+		switch {
+		case compatName != "" || strings.EqualFold(provider, "openai-compatibility"):
+			apiPrefix = "openai-compatibility"
+		case strings.EqualFold(provider, "gemini"):
+			apiPrefix = "gemini-api-key"
+		case strings.EqualFold(provider, "gemini-interactions"):
+			apiPrefix = "interactions-api-key"
+		case strings.EqualFold(provider, "codex"):
+			apiPrefix = "codex-api-key"
+		case strings.EqualFold(provider, "xai"):
+			apiPrefix = "xai-api-key"
+		case strings.EqualFold(provider, "claude"):
+			apiPrefix = "claude-api-key"
+		case strings.EqualFold(provider, "meta"):
+			apiPrefix = "meta-api-key"
 		}
-		return "config:" + strings.Join(parts, "\x00")
+	}
+	if apiPrefix != "" {
+		return apiPrefix + ":" + strings.TrimSpace(baseURL) + "+" + strings.TrimSpace(apiKey)
 	}
 
 	if id := strings.TrimSpace(a.ID); id != "" {
@@ -222,8 +416,10 @@ func (a *Auth) EnsureIndex() string {
 	if a == nil {
 		return ""
 	}
-	if a.indexAssigned && a.Index != "" {
-		return a.Index
+	if existingIndex := strings.TrimSpace(a.Index); existingIndex != "" {
+		a.Index = existingIndex
+		a.indexAssigned = true
+		return existingIndex
 	}
 
 	seed := a.indexSeed()
@@ -243,6 +439,7 @@ func (m *ModelState) Clone() *ModelState {
 		return nil
 	}
 	copyState := *m
+	copyState.Quota = m.Quota.Clone()
 	if m.LastError != nil {
 		copyState.LastError = &Error{
 			Code:       m.LastError.Code,
@@ -268,8 +465,9 @@ func (a *Auth) ProxyInfo() string {
 	return "via proxy"
 }
 
-// DisableCoolingOverride returns the auth-file scoped disable_cooling override when present.
+// DisableCoolingOverride returns the auth-scoped disable_cooling override when present.
 // The value is read from metadata key "disable_cooling" (or legacy "disable-cooling").
+// The second return value distinguishes explicit false from an absent override.
 func (a *Auth) DisableCoolingOverride() (bool, bool) {
 	if a == nil || a.Metadata == nil {
 		return false, false
@@ -304,8 +502,9 @@ func (a *Auth) ToolPrefixDisabled() bool {
 	return false
 }
 
-// RequestRetryOverride returns the auth-file scoped request_retry override when present.
+// RequestRetryOverride returns the auth-scoped request_retry override when present.
 // The value is read from metadata key "request_retry" (or legacy "request-retry").
+// A negative value is treated as unset and falls back to the global request-retry.
 func (a *Auth) RequestRetryOverride() (int, bool) {
 	if a == nil || a.Metadata == nil {
 		return 0, false
@@ -313,7 +512,7 @@ func (a *Auth) RequestRetryOverride() (int, bool) {
 	if val, ok := a.Metadata["request_retry"]; ok {
 		if parsed, okParse := parseIntAny(val); okParse {
 			if parsed < 0 {
-				parsed = 0
+				return 0, false
 			}
 			return parsed, true
 		}
@@ -321,7 +520,7 @@ func (a *Auth) RequestRetryOverride() (int, bool) {
 	if val, ok := a.Metadata["request-retry"]; ok {
 		if parsed, okParse := parseIntAny(val); okParse {
 			if parsed < 0 {
-				parsed = 0
+				return 0, false
 			}
 			return parsed, true
 		}
@@ -391,52 +590,75 @@ func (a *Auth) AccountInfo() (string, string) {
 	if a == nil {
 		return "", ""
 	}
-	// For Gemini CLI, include project ID in the OAuth account info if present.
-	if strings.ToLower(a.Provider) == "gemini-cli" {
+	switch a.AuthKind() {
+	case AuthKindOAuth:
 		if a.Metadata != nil {
-			email, _ := a.Metadata["email"].(string)
-			email = strings.TrimSpace(email)
-			if email != "" {
-				if p, ok := a.Metadata["project_id"].(string); ok {
-					p = strings.TrimSpace(p)
-					if p != "" {
-						return "oauth", email + " (" + p + ")"
-					}
+			if v, ok := a.Metadata["email"].(string); ok {
+				email := strings.TrimSpace(v)
+				if email != "" {
+					return "oauth", email
 				}
-				return "oauth", email
 			}
 		}
-	}
-
-	// Check metadata for email first (OAuth-style auth)
-	if a.Metadata != nil {
-		if v, ok := a.Metadata["email"].(string); ok {
-			email := strings.TrimSpace(v)
-			if email != "" {
-				return "oauth", email
-			}
+		return "oauth", ""
+	case AuthKindAPIKey:
+		if apiKey := authAttribute(a, AttributeAPIKey); apiKey != "" {
+			return "api_key", apiKey
 		}
+		return "api_key", ""
+	default:
+		return "", ""
 	}
-	// Fall back to API key (API-key auth)
-	if a.Attributes != nil {
-		if v := a.Attributes["api_key"]; v != "" {
-			return "api_key", v
-		}
-	}
-	return "", ""
 }
 
 // ExpirationTime attempts to extract the credential expiration timestamp from metadata.
-// It inspects common keys such as "expired", "expire", "expires_at", and also
-// nested "token" objects to remain compatible with legacy auth file formats.
+// It inspects common absolute expiry keys, expires_in plus timestamp, and nested
+// token objects to remain compatible with legacy auth file formats.
+// If the access_token contains a valid JWT exp claim, it is given priority.
 func (a *Auth) ExpirationTime() (time.Time, bool) {
 	if a == nil {
 		return time.Time{}, false
+	}
+	if tokenStr := authAccessToken(a); tokenStr != "" {
+		if jwtExp, ok := parseJWTExp(tokenStr); ok {
+			return jwtExp, true
+		}
 	}
 	if ts, ok := expirationFromMap(a.Metadata); ok {
 		return ts, true
 	}
 	return time.Time{}, false
+}
+
+// AccessTokenExpirationTime returns the expiration time of the specific access_token.
+// If the access_token is a JWT, its exp claim takes strict precedence.
+func (a *Auth) AccessTokenExpirationTime() (time.Time, bool) {
+	if a == nil {
+		return time.Time{}, false
+	}
+	tokenStr := authAccessToken(a)
+	if tokenStr == "" {
+		return time.Time{}, false
+	}
+	if jwtExp, ok := parseJWTExp(tokenStr); ok {
+		return jwtExp, true
+	}
+	return a.ExpirationTime()
+}
+
+// HasValidAccessToken returns whether the auth has a non-empty access token that is unexpired at the given time.
+func (a *Auth) HasValidAccessToken(now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	tokenStr := authAccessToken(a)
+	if tokenStr == "" {
+		return false
+	}
+	if exp, ok := a.AccessTokenExpirationTime(); ok {
+		return exp.After(now)
+	}
+	return true
 }
 
 var (
@@ -467,6 +689,11 @@ func expirationFromMap(meta map[string]any) (time.Time, bool) {
 			}
 		}
 	}
+	if expiresIn, okExpiresIn := parseRelativeExpirySeconds(meta); okExpiresIn {
+		if timestamp, okTimestamp := parseRelativeExpiryTimestamp(meta); okTimestamp {
+			return timestamp.Add(time.Duration(expiresIn) * time.Second), true
+		}
+	}
 	for _, nestedKey := range []string{"token", "Token"} {
 		if nested, ok := meta[nestedKey]; ok {
 			switch val := nested.(type) {
@@ -482,6 +709,87 @@ func expirationFromMap(meta map[string]any) (time.Time, bool) {
 				if ts, ok1 := expirationFromMap(temp); ok1 {
 					return ts, true
 				}
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+// parseJWTExp extracts the "exp" claim timestamp from a JWT token string without signature verification.
+func parseJWTExp(token string) (time.Time, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return time.Time{}, false
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
+	}
+	payloadSegment := parts[1]
+	var (
+		payloadBytes []byte
+		errDecode    error
+	)
+	switch len(payloadSegment) % 4 {
+	case 2:
+		payloadBytes, errDecode = base64.URLEncoding.DecodeString(payloadSegment + "==")
+	case 3:
+		payloadBytes, errDecode = base64.URLEncoding.DecodeString(payloadSegment + "=")
+	default:
+		payloadBytes, errDecode = base64.URLEncoding.DecodeString(payloadSegment)
+	}
+	if errDecode != nil {
+		payloadBytes, errDecode = base64.RawURLEncoding.DecodeString(payloadSegment)
+		if errDecode != nil {
+			return time.Time{}, false
+		}
+	}
+	var claims struct {
+		Exp any `json:"exp"`
+	}
+	if errJSON := json.Unmarshal(payloadBytes, &claims); errJSON != nil {
+		return time.Time{}, false
+	}
+	if claims.Exp == nil {
+		return time.Time{}, false
+	}
+	switch expVal := claims.Exp.(type) {
+	case float64:
+		if expVal > 0 {
+			return normaliseUnix(int64(expVal)), true
+		}
+	case int64:
+		if expVal > 0 {
+			return normaliseUnix(expVal), true
+		}
+	case int:
+		if expVal > 0 {
+			return normaliseUnix(int64(expVal)), true
+		}
+	case string:
+		if sec, errParse := strconv.ParseInt(strings.TrimSpace(expVal), 10, 64); errParse == nil && sec > 0 {
+			return normaliseUnix(sec), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func parseRelativeExpirySeconds(meta map[string]any) (int, bool) {
+	for _, key := range []string{"expires_in", "expiresIn"} {
+		if value, ok := meta[key]; ok {
+			if seconds, okSeconds := parseIntAny(value); okSeconds && seconds > 0 {
+				return seconds, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func parseRelativeExpiryTimestamp(meta map[string]any) (time.Time, bool) {
+	for _, key := range []string{"timestamp", "issued_at", "issuedAt"} {
+		if value, ok := meta[key]; ok {
+			if timestamp, okTimestamp := parseTimeValue(value); okTimestamp && !timestamp.IsZero() {
+				return timestamp, true
 			}
 		}
 	}
@@ -532,6 +840,10 @@ func parseTimeValue(v any) (time.Time, bool) {
 			return normaliseUnix(unix), true
 		}
 	case float64:
+		return normaliseUnix(int64(value)), true
+	case int:
+		return normaliseUnix(int64(value)), true
+	case int32:
 		return normaliseUnix(int64(value)), true
 	case int64:
 		return normaliseUnix(value), true
