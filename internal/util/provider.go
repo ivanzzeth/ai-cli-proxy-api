@@ -7,10 +7,24 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	log "github.com/sirupsen/logrus"
 )
+
+const openAICompatibleProviderPrefix = "openai-compatible-"
+
+// OpenAICompatibleProviderKey returns the internal provider key for an OpenAI-compatible provider.
+func OpenAICompatibleProviderKey(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" || name == "openai-compatibility" || strings.HasPrefix(name, openAICompatibleProviderPrefix) {
+		if name == "" {
+			return "openai-compatibility"
+		}
+		return name
+	}
+	return openAICompatibleProviderPrefix + name
+}
 
 // GetProviderName determines all AI service providers capable of serving a registered model.
 // It first queries the global model registry to retrieve the providers backing the supplied model name.
@@ -50,6 +64,11 @@ func GetProviderName(modelName string) []string {
 
 	for _, provider := range registry.GetGlobalRegistry().GetModelProviders(modelName) {
 		appendProvider(provider)
+	}
+	if len(providers) == 0 && strings.ToLower(modelName) != modelName {
+		for _, provider := range registry.GetGlobalRegistry().GetModelProviders(strings.ToLower(modelName)) {
+			appendProvider(provider)
+		}
 	}
 
 	if len(providers) > 0 {
