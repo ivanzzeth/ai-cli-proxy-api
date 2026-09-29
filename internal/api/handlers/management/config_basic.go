@@ -126,6 +126,15 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
 		return
 	}
+	// The dashboard still saves through /v0/management/config.yaml and may replace
+	// the v8 upstream provider map with a client-key list. Preserve providers and
+	// fold that list into access.api-keys before validating or writing.
+	if preserved, errPreserve := preserveUpstreamAPIKeysInYAML(h.configFilePath, body); errPreserve != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": errPreserve.Error()})
+		return
+	} else if preserved != nil {
+		body = preserved
+	}
 	// Validate config using LoadConfigOptional with optional=false to enforce parsing
 	tmpDir := filepath.Dir(h.configFilePath)
 	tmpFile, err := os.CreateTemp(tmpDir, "config-validate-*.yaml")
@@ -167,6 +176,32 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	}
 	h.cfg = newCfg
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
+}
+
+// preserveUpstreamAPIKeysInYAML keeps v8 upstream provider groups when a
+// full-document YAML save replaces them with a client-key list.
+func preserveUpstreamAPIKeysInYAML(configPath string, body []byte) ([]byte, error) {
+	current, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var previousDoc yaml.Node
+	if err = yaml.Unmarshal(current, &previousDoc); err != nil || len(previousDoc.Content) == 0 {
+		return nil, nil
+	}
+	var nextDoc yaml.Node
+	if err = yaml.Unmarshal(body, &nextDoc); err != nil || len(nextDoc.Content) == 0 {
+		return nil, nil
+	}
+	preserveV8UpstreamAPIKeys(previousDoc.Content[0], nextDoc.Content[0])
+	out, err := yaml.Marshal(&nextDoc)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // GetConfigYAML returns the raw config.yaml file bytes without re-encoding.
