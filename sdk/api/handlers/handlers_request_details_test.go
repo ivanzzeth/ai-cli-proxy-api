@@ -102,6 +102,20 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 			wantModel:     "claude-sonnet-4-5(auto)",
 			wantErr:       false,
 		},
+		{
+			name:          "context window marker stripped",
+			inputModel:    "gpt-5.2[1M]",
+			wantProviders: []string{"openai"},
+			wantModel:     "gpt-5.2",
+			wantErr:       false,
+		},
+		{
+			name:          "context window marker before thinking suffix",
+			inputModel:    "gpt-5.2[1m](high)",
+			wantProviders: []string{"openai"},
+			wantModel:     "gpt-5.2(high)",
+			wantErr:       false,
+		},
 	}
 
 	for _, tt := range tests {

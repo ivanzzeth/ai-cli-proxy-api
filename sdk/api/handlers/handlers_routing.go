@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/tidwall/sjson"
@@ -157,6 +158,10 @@ func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel
 }
 
 func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowImageModel bool) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+	// Clients such as Cursor append a context-window tag, for example
+	// "openai/gpt-5.6-sol[1M]" or "model[1m](high)". The registered id does not
+	// include that tag. Drop it before provider lookup and upstream forwarding.
+	modelName = stripContextWindowMarker(modelName)
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
 	if initialSuffix.ModelName == "auto" {
@@ -244,6 +249,14 @@ func isOpenAIImageOnlyModel(model string) bool {
 	default:
 		return false
 	}
+}
+
+// contextWindowMarker matches a Claude Code / Cursor context-window tag.
+// It is not part of the registered model id.
+var contextWindowMarker = regexp.MustCompile(`(?i)\[(?:1m|\d+k)\]`)
+
+func stripContextWindowMarker(model string) string {
+	return contextWindowMarker.ReplaceAllString(model, "")
 }
 
 func routeModelBaseName(model string) string {
