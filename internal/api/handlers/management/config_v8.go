@@ -120,6 +120,12 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 			*dst = *update.Content[0]
 		}
 	}
+	// Full-document saves from the visual editor used to write client keys into
+	// the v8 upstream map at `api-keys`, or delete that map entirely. Keep the
+	// provider groups and fold a client-key list into `access.api-keys`.
+	if len(parts) == 0 && c.Request.Method != http.MethodDelete {
+		preserveV8UpstreamAPIKeys(before, root)
+	}
 	if !yamlRequest && c.Request.Method != http.MethodDelete {
 		preserveV8TURNSecrets(root, before)
 	}
@@ -247,6 +253,81 @@ func preserveV8TURNSecrets(root, before *yaml.Node) {
 			break
 		}
 	}
+}
+
+// preserveV8UpstreamAPIKeys keeps upstream provider groups when a full-document
+// write omits them or replaces the `api-keys` mapping with a client-key list.
+func preserveV8UpstreamAPIKeys(previous, next *yaml.Node) {
+	prevGroups := configV8Node(previous, []string{"api-keys"})
+	if prevGroups == nil || prevGroups.Kind != yaml.MappingNode || next == nil {
+		return
+	}
+	nextGroups := configV8Node(next, []string{"api-keys"})
+	if nextGroups != nil && nextGroups.Kind == yaml.MappingNode {
+		return
+	}
+	var incoming []string
+	if nextGroups != nil && nextGroups.Kind == yaml.SequenceNode {
+		if err := nextGroups.Decode(&incoming); err != nil {
+			incoming = nil
+		}
+	}
+	if len(incoming) > 0 {
+		var have []string
+		if existing := configV8Node(next, []string{"access", "api-keys"}); existing != nil {
+			_ = existing.Decode(&have)
+		}
+		if len(have) == 0 {
+			if existing := configV8Node(previous, []string{"access", "api-keys"}); existing != nil {
+				_ = existing.Decode(&have)
+			}
+		}
+		merged := append([]string(nil), have...)
+		seen := make(map[string]bool, len(merged))
+		for _, key := range merged {
+			seen[key] = true
+		}
+		for _, key := range incoming {
+			key = strings.TrimSpace(key)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			merged = append(merged, key)
+		}
+		setConfigV8Node(next, []string{"access", "api-keys"}, yamlStringList(merged))
+	}
+	setConfigV8Node(next, []string{"api-keys"}, cloneConfigV8Node(prevGroups))
+}
+
+func yamlStringList(values []string) *yaml.Node {
+	node := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	for _, value := range values {
+		node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value})
+	}
+	return node
+}
+
+func setConfigV8Node(root *yaml.Node, parts []string, value *yaml.Node) {
+	if root == nil || root.Kind != yaml.MappingNode || len(parts) == 0 || value == nil {
+		return
+	}
+	for _, part := range parts[:len(parts)-1] {
+		next := configV8Node(root, []string{part})
+		if next == nil || next.Kind != yaml.MappingNode {
+			next = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: part}, next)
+		}
+		root = next
+	}
+	key := parts[len(parts)-1]
+	for i := 0; i < len(root.Content); i += 2 {
+		if root.Content[i].Value == key {
+			root.Content[i+1] = value
+			return
+		}
+	}
+	root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, value)
 }
 
 func configV8Node(root *yaml.Node, parts []string) *yaml.Node {

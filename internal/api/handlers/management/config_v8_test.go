@@ -407,6 +407,73 @@ func TestConfigV8EmptyExcludedModelsSurvivesSave(t *testing.T) {
 	}
 }
 
+func TestConfigV8ClientKeySaveKeepsUpstreamProviders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const original = `config-version: 8
+access:
+  api-keys:
+    - existing
+api-keys:
+  openai-compatibility:
+    - name: sub2api
+      base-url: https://example.test/v1
+      models:
+        - name: gpt-5.6-sol
+      keys:
+        - api-key: upstream-secret
+server:
+  port: 8317
+`
+	for _, body := range []string{
+		`config-version: 8
+access:
+  api-keys:
+    - existing
+api-keys:
+  - added
+server:
+  port: 8317
+`,
+		`config-version: 8
+access:
+  api-keys:
+    - existing
+server:
+  port: 8317
+`,
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := &Handler{cfg: cfg, configFilePath: path}
+		router := gin.New()
+		router.PUT("/v8/management/config.yaml", h.ConfigV8)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/v8/management/config.yaml", strings.NewReader(body)))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		loaded, err := config.LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(loaded.OpenAICompatibility) != 1 || loaded.OpenAICompatibility[0].Name != "sub2api" {
+			t.Fatalf("upstream providers lost: %+v", loaded.OpenAICompatibility)
+		}
+		if !reflect.DeepEqual(loaded.APIKeys, []string{"existing", "added"}) && !reflect.DeepEqual(loaded.APIKeys, []string{"existing"}) {
+			t.Fatalf("client keys = %#v", loaded.APIKeys)
+		}
+		if strings.Contains(body, "- added") && !reflect.DeepEqual(loaded.APIKeys, []string{"existing", "added"}) {
+			t.Fatalf("added key missing: %#v", loaded.APIKeys)
+		}
+	}
+}
+
 func TestConfigV8JSONTURNSecrets(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	raw := []byte(`oauth:
