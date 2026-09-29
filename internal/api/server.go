@@ -247,7 +247,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		s.registerManagementRoutes()
 	}
 	s.refreshPluginManagementRoutes()
-	engine.NoRoute(s.pluginManagementNoRoute)
+	engine.NoRoute(s.routeDuplicateV1Prefix)
 
 	if optionState.keepAliveEnabled {
 		s.enableKeepAlive(optionState.keepAliveTimeout, optionState.keepAliveOnTimeout)

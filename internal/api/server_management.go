@@ -251,6 +251,30 @@ func (s *Server) registeredManagementRouteKeys() map[string]struct{} {
 	return out
 }
 
+func (s *Server) routeDuplicateV1Prefix(c *gin.Context) {
+	// Clients that set the API base to .../v1 and then call /v1/messages
+	// land on /v1/v1/messages. Collapse one extra /v1 before giving up.
+	if path, ok := collapseDuplicateV1Prefix(c.Request.URL.Path); ok {
+		c.Request.URL.Path = path
+		if c.Request.URL.RawPath != "" {
+			if raw, rawOK := collapseDuplicateV1Prefix(c.Request.URL.RawPath); rawOK {
+				c.Request.URL.RawPath = raw
+			}
+		}
+		s.engine.HandleContext(c)
+		return
+	}
+	s.pluginManagementNoRoute(c)
+}
+
+func collapseDuplicateV1Prefix(path string) (string, bool) {
+	const doubled = "/v1/v1/"
+	if !strings.HasPrefix(path, doubled) {
+		return path, false
+	}
+	return "/v1/" + strings.TrimPrefix(path, doubled), true
+}
+
 func (s *Server) pluginManagementNoRoute(c *gin.Context) {
 	if s == nil || c == nil || c.Request == nil || c.Request.URL == nil {
 		if c != nil {
