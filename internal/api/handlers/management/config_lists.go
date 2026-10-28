@@ -195,6 +195,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		Weight              json.RawMessage                  `json:"weight"`
 		Prefix              *string                          `json:"prefix"`
 		BaseURL             *string                          `json:"base-url"`
+		Models              *[]config.GeminiModel            `json:"models"`
 		ProxyURL            *string                          `json:"proxy-url"`
 		Headers             *map[string]string               `json:"headers"`
 		ExcludedModels      *[]string                        `json:"excluded-models"`
@@ -246,7 +247,6 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "item not found"})
 		return
 	}
-
 	entry := h.cfg.GeminiKey[targetIndex]
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
@@ -267,6 +267,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 	if body.Value.BaseURL != nil {
 		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
+	}
+	if body.Value.Models != nil {
+		entry.Models = append([]config.GeminiModel(nil), (*body.Value.Models)...)
 	}
 	if body.Value.ProxyURL != nil {
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
@@ -614,6 +617,14 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	for index := range arr {
+		for other := 0; other < index; other++ {
+			if conflictingManagedClaudePrefix(arr[index], arr[other]) {
+				c.JSON(409, gin.H{"error": "managed model prefix belongs to another provider"})
+				return
+			}
+		}
+	}
 	for i := range arr {
 		if arr[i].Cloak == nil {
 			if old := h.findExistingClaudeKey(h.cfg.ClaudeKey, arr[i]); old != nil && old.Cloak != nil && old.Cloak.Mode != "" {
@@ -713,6 +724,12 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	if body.Value.Prefix != nil {
 		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
 	}
+	for index, existing := range h.cfg.ClaudeKey {
+		if index != targetIndex && conflictingManagedClaudePrefix(entry, existing) {
+			c.JSON(409, gin.H{"error": "managed model prefix belongs to another provider"})
+			return
+		}
+	}
 	if body.Value.BaseURL != nil {
 		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
 	}
@@ -803,14 +820,22 @@ func (h *Handler) DeleteClaudeKey(c *gin.Context) {
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
 		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
 			base := strings.TrimSpace(baseRaw)
-			out := make([]config.ClaudeKey, 0, len(h.cfg.ClaudeKey))
-			for _, v := range h.cfg.ClaudeKey {
-				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+			matchIndex := -1
+			for index, entry := range h.cfg.ClaudeKey {
+				if strings.TrimSpace(entry.APIKey) != val || strings.TrimSpace(entry.BaseURL) != base {
 					continue
 				}
-				out = append(out, v)
+				if matchIndex != -1 {
+					c.JSON(400, gin.H{"error": "multiple items match; index is required"})
+					return
+				}
+				matchIndex = index
 			}
-			h.cfg.ClaudeKey = out
+			if matchIndex == -1 {
+				c.JSON(404, gin.H{"error": "item not found"})
+				return
+			}
+			h.cfg.ClaudeKey = append(h.cfg.ClaudeKey[:matchIndex], h.cfg.ClaudeKey[matchIndex+1:]...)
 			h.cfg.SanitizeClaudeKeys()
 			h.persistLocked(c)
 			return
@@ -872,10 +897,18 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 		arr = obj.Items
 	}
 	filtered := make([]config.OpenAICompatibility, 0, len(arr))
+	seenPrefixes := make(map[string]bool, len(arr))
 	for i := range arr {
 		normalizeOpenAICompatibilityEntry(&arr[i])
 		if strings.TrimSpace(arr[i].BaseURL) == "" {
 			continue
+		}
+		if prefix := strings.TrimSpace(arr[i].Prefix); prefix != "" {
+			if seenPrefixes[prefix] {
+				c.JSON(409, gin.H{"error": "provider model prefix already exists"})
+				return
+			}
+			seenPrefixes[prefix] = true
 		}
 		for keyIndex := range arr[i].APIKeyEntries {
 			field := fmt.Sprintf("openai-compatibility[%d].api-key-entries[%d].weight", i, keyIndex)
@@ -900,6 +933,10 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		DisableCooling        json.RawMessage                     `json:"disable-cooling"`
 		BaseURL               *string                             `json:"base-url"`
 		APIKeyEntries         *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
+		ExpectedAPIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"expected-api-key-entries"`
+		AppendAPIKeyEntries   *[]config.OpenAICompatibilityAPIKey `json:"append-api-key-entries"`
+		RemoveAPIKey          *string                             `json:"remove-api-key"`
+		ExpectedDescription   *string                             `json:"expected-description"`
 		Models                *[]config.OpenAICompatibilityModel  `json:"models"`
 		Headers               *map[string]string                  `json:"headers"`
 		SupportPromptCacheKey *bool                               `json:"support-prompt-cache-key"`
@@ -933,6 +970,130 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 	if targetIndex == -1 {
 		c.JSON(404, gin.H{"error": "item not found"})
+		return
+	}
+	if body.Value.ExpectedDescription != nil {
+		if body.Name == nil || body.Index != nil || h.cfg.OpenAICompatibility[targetIndex].Description != *body.Value.ExpectedDescription {
+			c.JSON(409, gin.H{"error": "provider ownership changed"})
+			return
+		}
+		for index := range h.cfg.OpenAICompatibility {
+			if index != targetIndex && h.cfg.OpenAICompatibility[index].Name == strings.TrimSpace(*body.Name) {
+				c.JSON(409, gin.H{"error": "duplicate provider name"})
+				return
+			}
+		}
+	}
+	if body.Value.Prefix != nil {
+		prefix := strings.TrimSpace(*body.Value.Prefix)
+		if prefix != "" {
+			for index := range h.cfg.OpenAICompatibility {
+				if index != targetIndex && h.cfg.OpenAICompatibility[index].Prefix == prefix {
+					c.JSON(409, gin.H{"error": "provider model prefix already exists"})
+					return
+				}
+			}
+		}
+	}
+	if body.Value.ExpectedAPIKeyEntries != nil {
+		if body.Value.ExpectedDescription == nil || body.Value.APIKeyEntries == nil || body.Value.AppendAPIKeyEntries != nil || body.Value.RemoveAPIKey != nil {
+			c.JSON(400, gin.H{"error": "invalid conditional credential replacement"})
+			return
+		}
+		current := h.cfg.OpenAICompatibility[targetIndex].APIKeyEntries
+		expected := *body.Value.ExpectedAPIKeyEntries
+		if len(current) != len(expected) {
+			c.JSON(409, gin.H{"error": "credential pool changed"})
+			return
+		}
+		for index := range current {
+			if current[index].APIKey != expected[index].APIKey || current[index].ProxyURL != expected[index].ProxyURL || (current[index].Weight == nil) != (expected[index].Weight == nil) || current[index].Weight != nil && *current[index].Weight != *expected[index].Weight {
+				c.JSON(409, gin.H{"error": "credential pool changed"})
+				return
+			}
+		}
+	}
+	if body.Value.AppendAPIKeyEntries != nil {
+		if body.Name == nil || body.Index != nil || body.Value.ExpectedDescription == nil || body.Value.APIKeyEntries != nil || body.Value.RemoveAPIKey != nil || len(*body.Value.AppendAPIKeyEntries) == 0 || body.Value.Name != nil {
+			c.JSON(400, gin.H{"error": "invalid credential append"})
+			return
+		}
+		provider := h.cfg.OpenAICompatibility[targetIndex]
+		if provider.Name != strings.TrimSpace(*body.Name) || provider.Description != *body.Value.ExpectedDescription {
+			c.JSON(409, gin.H{"error": "provider ownership changed"})
+			return
+		}
+		for index := range h.cfg.OpenAICompatibility {
+			if index != targetIndex && h.cfg.OpenAICompatibility[index].Name == provider.Name {
+				c.JSON(409, gin.H{"error": "duplicate provider name"})
+				return
+			}
+		}
+		if len(provider.APIKeyEntries)+len(*body.Value.AppendAPIKeyEntries) > 50 {
+			c.JSON(400, gin.H{"error": "credential pool exceeds 50 keys"})
+			return
+		}
+		seen := make(map[string]bool, len(provider.APIKeyEntries)+len(*body.Value.AppendAPIKeyEntries))
+		for _, item := range provider.APIKeyEntries {
+			seen[strings.TrimSpace(item.APIKey)] = true
+		}
+		for index, item := range *body.Value.AppendAPIKeyEntries {
+			key := strings.TrimSpace(item.APIKey)
+			if key == "" || seen[key] {
+				c.JSON(400, gin.H{"error": "empty or duplicate credential"})
+				return
+			}
+			if rejectInvalidCredentialWeight(c, fmt.Sprintf("append-api-key-entries[%d].weight", index), item.Weight) {
+				return
+			}
+			seen[key] = true
+		}
+		if body.Value.BaseURL != nil && strings.TrimSpace(*body.Value.BaseURL) == "" {
+			c.JSON(400, gin.H{"error": "cannot remove provider while appending credentials"})
+			return
+		}
+	}
+	if body.Value.RemoveAPIKey != nil {
+		if body.Name == nil || body.Index != nil || body.Value.ExpectedDescription == nil ||
+			strings.TrimSpace(*body.Value.RemoveAPIKey) == "" || body.Value.APIKeyEntries != nil || body.Value.BaseURL != nil ||
+			body.Value.Name != nil || body.Value.Priority != nil || body.Value.Prefix != nil || body.Value.Disabled != nil ||
+			len(body.Value.DisableCooling) != 0 || body.Value.Models != nil || body.Value.Headers != nil ||
+			body.Value.SupportPromptCacheKey != nil || body.Value.RequestRetry != nil || body.Value.RequestScopedErrors != nil {
+			c.JSON(400, gin.H{"error": "invalid credential removal"})
+			return
+		}
+		provider := &h.cfg.OpenAICompatibility[targetIndex]
+		for index := range h.cfg.OpenAICompatibility {
+			if index != targetIndex && h.cfg.OpenAICompatibility[index].Name == provider.Name {
+				c.JSON(409, gin.H{"error": "duplicate provider name"})
+				return
+			}
+		}
+		if provider.Name != strings.TrimSpace(*body.Name) || provider.Description != *body.Value.ExpectedDescription {
+			c.JSON(409, gin.H{"error": "provider ownership changed"})
+			return
+		}
+		keyIndex := -1
+		for index := range provider.APIKeyEntries {
+			if provider.APIKeyEntries[index].APIKey == strings.TrimSpace(*body.Value.RemoveAPIKey) {
+				if keyIndex != -1 {
+					c.JSON(409, gin.H{"error": "duplicate credential"})
+					return
+				}
+				keyIndex = index
+			}
+		}
+		if keyIndex < 0 {
+			c.JSON(404, gin.H{"error": "credential not found"})
+			return
+		}
+		if len(provider.APIKeyEntries) < 2 {
+			c.JSON(409, gin.H{"error": "cannot remove last credential"})
+			return
+		}
+		provider.APIKeyEntries = append(provider.APIKeyEntries[:keyIndex], provider.APIKeyEntries[keyIndex+1:]...)
+		h.cfg.SanitizeOpenAICompatibility()
+		h.persistLocked(c)
 		return
 	}
 
@@ -973,6 +1134,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 			}
 		}
 		entry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)
+	}
+	if body.Value.AppendAPIKeyEntries != nil {
+		entry.APIKeyEntries = append(entry.APIKeyEntries, (*body.Value.AppendAPIKeyEntries)...)
 	}
 	if body.Value.Models != nil {
 		entry.Models = append([]config.OpenAICompatibilityModel(nil), (*body.Value.Models)...)

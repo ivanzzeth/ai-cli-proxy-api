@@ -93,8 +93,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
+		mgmt.POST("/gemini-api-key", s.mgmt.PostGeminiKey)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
 		mgmt.PATCH("/gemini-api-key", s.mgmt.PatchGeminiKey)
+		mgmt.PATCH("/gemini-api-key/managed-pool", s.mgmt.PatchManagedGeminiPool)
 		mgmt.DELETE("/gemini-api-key", s.mgmt.DeleteGeminiKey)
 
 		mgmt.GET("/interactions-api-key", s.mgmt.GetInteractionsKeys)
@@ -133,8 +135,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
+		mgmt.POST("/claude-api-key", s.mgmt.PostClaudeKey)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
 		mgmt.PATCH("/claude-api-key", s.mgmt.PatchClaudeKey)
+		mgmt.PATCH("/claude-api-key/managed-pool", s.mgmt.PatchManagedClaudePool)
 		mgmt.DELETE("/claude-api-key", s.mgmt.DeleteClaudeKey)
 
 		mgmt.GET("/codex-api-key", s.mgmt.GetCodexKeys)
@@ -153,6 +157,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/meta-api-key", s.mgmt.DeleteMetaKey)
 
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
+		mgmt.POST("/openai-compatibility", s.mgmt.PostOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
 		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)

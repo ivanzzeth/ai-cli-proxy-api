@@ -214,6 +214,24 @@ func TestDeleteClaudeKey_DeletesEmptyBaseURLWhenExplicitlyProvided(t *testing.T)
 	}
 }
 
+func TestDeleteClaudeKey_RejectsAmbiguousIdentity(t *testing.T) {
+	t.Parallel()
+	h := &Handler{
+		cfg: &config.Config{ClaudeKey: []config.ClaudeKey{
+			{APIKey: "shared", BaseURL: "https://provider.example", Prefix: "managed"},
+			{APIKey: "shared", BaseURL: "https://provider.example", Prefix: "operator"},
+		}},
+		configFilePath: writeTestConfigFile(t),
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/claude-api-key?api-key=shared&base-url=https://provider.example", nil)
+	h.DeleteClaudeKey(ctx)
+	if recorder.Code != http.StatusBadRequest || len(h.cfg.ClaudeKey) != 2 {
+		t.Fatalf("ambiguous delete status=%d remaining=%d", recorder.Code, len(h.cfg.ClaudeKey))
+	}
+}
+
 func TestDeleteVertexCompatKey_DeletesOnlyMatchingBaseURL(t *testing.T) {
 	t.Parallel()
 

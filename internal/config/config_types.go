@@ -469,6 +469,9 @@ type CloakConfig struct {
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
+	// Description identifies a control-plane-managed credential without affecting routing.
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+
 	// APIKey is the authentication key for accessing Claude API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -702,6 +705,8 @@ type MetaModel = CodexModel
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
+	// Description identifies a credential created by a control plane.
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 	// APIKey is the authentication key for accessing Gemini API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -792,6 +797,9 @@ func (m GeminiModel) GetThinking() *registry.ThinkingSupport { return m.Thinking
 type OpenAICompatibility struct {
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
+
+	// Description identifies an entry managed by a control plane. It has no routing effect.
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 
 	// Priority controls selection preference when multiple providers or credentials match.
 	// Higher values are preferred; defaults to 0.
