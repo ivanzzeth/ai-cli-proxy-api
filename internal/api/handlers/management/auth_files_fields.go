@@ -943,42 +943,48 @@ func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
 }
 
 func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
+	path, _, err := h.saveTokenRecordWithAuthID(ctx, record)
+	return path, err
+}
+
+func (h *Handler) saveTokenRecordWithAuthID(ctx context.Context, record *coreauth.Auth) (string, string, error) {
 	if record == nil {
-		return "", fmt.Errorf("token record is nil")
+		return "", "", fmt.Errorf("token record is nil")
 	}
 	h.mergeExistingAuthFileMetadata(record)
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
-		return "", fmt.Errorf("token store unavailable")
+		return "", "", fmt.Errorf("token store unavailable")
 	}
 	legacyClaudeCredential, errLegacy := claudeauth.FindMatchingLegacyCredential(ctx, store, record)
 	if errLegacy != nil {
-		return "", errLegacy
+		return "", "", errLegacy
 	}
 	if legacyClaudeCredential != nil {
 		coreauth.MergeExistingAuthMetadata(record, legacyClaudeCredential.Metadata)
 	}
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {
-			return "", fmt.Errorf("post-auth hook failed: %w", err)
+			return "", "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
 	savedPath, errSave := store.Save(coreauth.WithAuthCreationIntent(ctx), record)
 	if errSave != nil {
-		return savedPath, errSave
+		return savedPath, "", errSave
 	}
 	if legacyClaudeCredential != nil {
 		if strings.TrimSpace(savedPath) == "" {
-			return "", fmt.Errorf("canonical Claude credential was not persisted; legacy credential retained")
+			return "", "", fmt.Errorf("canonical Claude credential was not persisted; legacy credential retained")
 		}
 		legacyID := strings.TrimSpace(legacyClaudeCredential.ID)
 		if legacyID == "" {
 			legacyID = strings.TrimSpace(legacyClaudeCredential.FileName)
 		}
 		if errDelete := store.Delete(ctx, legacyID); errDelete != nil {
-			return savedPath, fmt.Errorf("canonical Claude credential saved but legacy credential cleanup failed: %w", errDelete)
+			return savedPath, "", fmt.Errorf("canonical Claude credential saved but legacy credential cleanup failed: %w", errDelete)
 		}
 	}
+	persistedAuthID := strings.TrimSpace(record.ID)
 	if h.postAuthPersistHook != nil {
 		persistedRecord := record
 		if data, errRead := os.ReadFile(savedPath); errRead == nil && len(data) > 0 {
@@ -990,7 +996,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 				PluginAuthParser: h.pluginHost,
 			}, savedPath, data)
 			if errSynthesize != nil {
-				return savedPath, fmt.Errorf("synthesize persisted auth failed: %w", errSynthesize)
+				return savedPath, "", fmt.Errorf("synthesize persisted auth failed: %w", errSynthesize)
 			}
 			for _, auth := range auths {
 				if auth != nil && (auth.ID == record.ID || len(auths) == 1) {
@@ -1000,8 +1006,9 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			}
 		}
 		if errHook := h.postAuthPersistHook(ctx, persistedRecord); errHook != nil {
-			return savedPath, fmt.Errorf("post-auth persist hook failed: %w", errHook)
+			return savedPath, "", fmt.Errorf("post-auth persist hook failed: %w", errHook)
 		}
+		persistedAuthID = strings.TrimSpace(persistedRecord.ID)
 	}
-	return savedPath, nil
+	return savedPath, persistedAuthID, nil
 }

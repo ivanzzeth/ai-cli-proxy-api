@@ -342,3 +342,147 @@ func replaceOAuthSessionStoreForTest(t *testing.T, store *oauthSessionStore) {
 		oauthSessions = original
 	})
 }
+
+func TestPluginCompletionCredentialIDsAreSessionBoundAndCopied(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	if err := store.RegisterPlugin("bound", "cursor", map[string]any{"private": "must-clear"}); err != nil {
+		t.Fatal(err)
+	}
+	if store.ClaimPluginCompletion("bound", "other") != nil {
+		t.Fatal("wrong provider claimed")
+	}
+	claim := store.ClaimPluginCompletion("bound", "cursor")
+	if claim == nil || store.ClaimPluginCompletion("bound", "cursor") != nil {
+		t.Fatal("completion must have one owner")
+	}
+	store.SetError("bound", "competing poll error")
+	store.Complete("bound")
+	if store.CompleteProvider("cursor", oauthSessionSourcePlugin) != 0 {
+		t.Fatal("generic completion stole active owner")
+	}
+	ids := []string{"saved-id"}
+	if !store.CompletePlugin(claim, ids) {
+		t.Fatal("owned completion failed")
+	}
+	ids[0] = "mutated"
+	first, _ := store.Get("bound")
+	if len(first.CredentialIDs) != 1 || first.CredentialIDs[0] != "saved-id" || first.Metadata != nil {
+		t.Fatal("identity or metadata invariant")
+	}
+	first.CredentialIDs[0] = "changed-copy"
+	if store.CompletePlugin(claim, []string{"other-id"}) {
+		t.Fatal("completed session overwritten")
+	}
+	second, _ := store.Get("bound")
+	if second.CredentialIDs[0] != "saved-id" || !second.ExpiresAt.Equal(first.ExpiresAt) {
+		t.Fatal("replay changed identity or TTL")
+	}
+	second.ExpiresAt = time.Now().Add(-time.Second)
+	store.mu.Lock()
+	store.sessions["bound"] = second
+	store.mu.Unlock()
+	if _, ok := store.Get("bound"); ok {
+		t.Fatal("expired identity leaked")
+	}
+}
+
+func TestPluginCompletionOwnerReleaseCancelAndReplacement(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	if err := store.RegisterPlugin("reuse", "cursor", nil); err != nil {
+		t.Fatal(err)
+	}
+	old := store.ClaimPluginCompletion("reuse", "cursor")
+	store.ReleasePluginCompletion(old)
+	next := store.ClaimPluginCompletion("reuse", "cursor")
+	if next == nil || next == old {
+		t.Fatal("pending release did not allow a new owner")
+	}
+	if store.CompletePlugin(old, []string{"stale-id"}) {
+		t.Fatal("released owner completed")
+	}
+	if !store.Cancel("reuse") {
+		t.Fatal("active poll must remain cancellable")
+	}
+	if err := store.RegisterPlugin("reuse", "cursor", nil); err != nil {
+		t.Fatal(err)
+	}
+	fresh := store.ClaimPluginCompletion("reuse", "cursor")
+	store.FailPluginCompletion(next, "stale error")
+	if store.CompletePlugin(next, []string{"cancelled-id"}) {
+		t.Fatal("cancelled owner completed replacement")
+	}
+	if !store.CompletePlugin(fresh, []string{"fresh-id"}) {
+		t.Fatal("stale owner corrupted replacement")
+	}
+}
+
+func TestGetAuthStatusReturnsOnlyBoundPluginIdentityOnRepeat(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	replaceOAuthSessionStoreForTest(t, store)
+	if err := store.RegisterPlugin("bound-status", "cursor", nil); err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ClaimPluginCompletion("bound-status", "cursor")
+	if claim == nil || !store.CompletePlugin(claim, []string{"same-existing-id"}) {
+		t.Fatal("fixture completion")
+	}
+	router := gin.New()
+	router.GET("/status", (&Handler{}).GetAuthStatus)
+	for i := 0; i < 2; i++ {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/status?state=bound-status", nil))
+		var got struct {
+			Status   string   `json:"status"`
+			Provider string   `json:"provider"`
+			IDs      []string `json:"credential_ids"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != "ok" || got.Provider != "cursor" || len(got.IDs) != 1 || got.IDs[0] != "same-existing-id" {
+			t.Fatalf("unexpected identity response: %#v", got)
+		}
+	}
+}
+
+func TestPluginClaimCapturesCurrentSessionMetadataAfterReplacement(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	if err := store.RegisterPlugin("metadata-reuse", "cursor", map[string]any{"login": "old"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _ := store.Get("metadata-reuse")
+	if !store.Cancel("metadata-reuse") {
+		t.Fatal("cancel fixture")
+	}
+	if err := store.RegisterPlugin("metadata-reuse", "cursor", map[string]any{"login": "new"}); err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ClaimPluginCompletion("metadata-reuse", "cursor")
+	if claim == nil || claim.metadata["login"] != "new" {
+		t.Fatal("claim reused stale metadata")
+	}
+	snapshot.Metadata["login"] = "corrupted-old-snapshot"
+	fresh, _ := store.Get("metadata-reuse")
+	fresh.Metadata["login"] = "changed-copy"
+	if claim.metadata["login"] != "new" {
+		t.Fatal("claim metadata aliases a read snapshot")
+	}
+}
+
+func TestBuiltinCompletedStatusDoesNotGainPluginIdentityFields(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	replaceOAuthSessionStoreForTest(t, store)
+	store.Register("builtin-contract", "codex")
+	store.Complete("builtin-contract")
+	router := gin.New()
+	router.GET("/status", (&Handler{}).GetAuthStatus)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/status?state=builtin-contract", nil))
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || string(got["status"]) != `"ok"` {
+		t.Fatalf("builtin contract drift: %s", response.Body.String())
+	}
+}

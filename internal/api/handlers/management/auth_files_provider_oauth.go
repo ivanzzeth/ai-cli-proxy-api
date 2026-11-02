@@ -947,13 +947,13 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 		return
 	}
 
-	provider, status, isPlugin, metadata, completed, ok := GetOAuthSessionDetails(state)
+	provider, status, isPlugin, _, completed, ok := GetOAuthSessionDetails(state)
 	if !ok {
 		c.JSON(http.StatusOK, gin.H{"status": "error", "error": "unknown or expired state"})
 		return
 	}
 	if completed {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, completedOAuthStatusResponse(state))
 		return
 	}
 	if status != "" {
@@ -964,15 +964,21 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 	host := h.pluginHost
 	h.mu.Unlock()
 	if isPlugin && host != nil && host.HasAuthProvider(provider) {
+		claim := oauthSessions.ClaimPluginCompletion(state, provider)
+		if claim == nil {
+			c.JSON(http.StatusOK, gin.H{"status": "wait"})
+			return
+		}
+		defer oauthSessions.ReleasePluginCompletion(claim)
 		ctx := PopulateAuthContext(context.Background(), c)
-		resp, handled, errPoll := host.PollLogin(ctx, provider, state, metadata)
+		resp, handled, errPoll := host.PollLogin(ctx, provider, state, claim.metadata)
 		if handled {
 			if errPoll != nil {
 				message := strings.TrimSpace(errPoll.Error())
 				if message == "" {
 					message = "Authentication failed"
 				}
-				SetOAuthSessionError(state, message)
+				oauthSessions.FailPluginCompletion(claim, message)
 				c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
 				return
 			}
@@ -985,24 +991,29 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 				if message == "" {
 					message = "Authentication failed"
 				}
-				SetOAuthSessionError(state, message)
+				oauthSessions.FailPluginCompletion(claim, message)
 				c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
 				return
 			case pluginapi.AuthLoginStatusSuccess:
 				records := pluginLoginPollAuths(host, resp)
 				if len(records) == 0 {
-					SetOAuthSessionError(state, "Authentication failed")
+					oauthSessions.FailPluginCompletion(claim, "Authentication failed")
 					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Authentication failed"})
 					return
 				}
-				if errSave := h.savePluginLoginRecords(ctx, records); errSave != nil {
+				ids, errSave := h.savePluginLoginRecordsWithIDs(ctx, records)
+				if errSave != nil {
 					log.WithError(errSave).WithField("provider", provider).Error("failed to save plugin auth tokens")
-					SetOAuthSessionError(state, "Failed to save authentication tokens")
+					oauthSessions.FailPluginCompletion(claim, "Failed to save authentication tokens")
 					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Failed to save authentication tokens"})
 					return
 				}
-				CompleteOAuthSession(state)
-				c.JSON(http.StatusOK, gin.H{"status": "ok"})
+				if !oauthSessions.CompletePlugin(claim, ids) {
+					oauthSessions.FailPluginCompletion(claim, "OAuth completion identity unavailable")
+					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "OAuth completion identity unavailable"})
+					return
+				}
+				c.JSON(http.StatusOK, completedOAuthStatusResponse(state))
 				return
 			default:
 				c.JSON(http.StatusOK, gin.H{"status": "wait"})
@@ -1033,18 +1044,29 @@ func pluginLoginPollAuths(host *pluginhost.Host, resp pluginapi.AuthLoginPollRes
 }
 
 func (h *Handler) savePluginLoginRecords(ctx context.Context, records []*coreauth.Auth) error {
+	_, err := h.savePluginLoginRecordsWithIDs(ctx, records)
+	return err
+}
+
+func (h *Handler) savePluginLoginRecordsWithIDs(ctx context.Context, records []*coreauth.Auth) ([]string, error) {
 	savedPaths := make([]string, 0, len(records))
+	ids := make([]string, 0, len(records))
 	for _, record := range records {
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, id, errSave := h.saveTokenRecordWithAuthID(ctx, record)
 		if strings.TrimSpace(savedPath) != "" {
 			savedPaths = append(savedPaths, savedPath)
 		}
 		if errSave != nil {
 			h.rollbackSavedTokenRecords(ctx, savedPaths)
-			return errSave
+			return nil, errSave
 		}
+		// A successful save without identity must not be advertised or destructively rolled back.
+		if strings.TrimSpace(id) == "" {
+			return nil, fmt.Errorf("persisted auth identity is missing")
+		}
+		ids = append(ids, id)
 	}
-	return nil
+	return ids, nil
 }
 
 func (h *Handler) rollbackSavedTokenRecords(ctx context.Context, savedPaths []string) {

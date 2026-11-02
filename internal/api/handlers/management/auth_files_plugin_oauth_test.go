@@ -2,8 +2,10 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,12 +13,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -407,5 +411,274 @@ func TestV8PluginOAuthUsesIndependentCallback(t *testing.T) {
 	}
 	if callCount != 2 {
 		t.Fatalf("plugin login calls=%d, want 2", callCount)
+	}
+}
+
+func TestPluginSavedIDsUsePostPersistRecord(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+	h.tokenStore = &pluginLoginRollbackStore{}
+	h.postAuthPersistHook = func(_ context.Context, auth *coreauth.Auth) error { auth.ID = "actual-registered-id"; return nil }
+	ids, err := h.savePluginLoginRecordsWithIDs(context.Background(), []*coreauth.Auth{{ID: "plugin-input-id", Provider: "cursor", Metadata: map[string]any{"type": "cursor"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(ids, []string{"actual-registered-id"}) {
+		t.Fatalf("saved IDs = %#v", ids)
+	}
+}
+
+func TestConcurrentPluginStatusOwnsPollAndSave(t *testing.T) {
+	store := newOAuthSessionStore(time.Minute)
+	replaceOAuthSessionStoreForTest(t, store)
+	if err := store.RegisterPlugin("concurrent-proof", "cursor", nil); err != nil {
+		t.Fatal(err)
+	}
+	pollEntered, releasePoll := make(chan struct{}), make(chan struct{})
+	saveEntered, releaseSave := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	provider := &testAuthProvider{identifier: "cursor", pollLogin: func(context.Context, pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
+		if calls.Add(1) != 1 {
+			return pluginapi.AuthLoginPollResponse{}, errors.New("competing poll failed")
+		}
+		close(pollEntered)
+		<-releasePoll
+		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Auth: pluginapi.AuthData{Provider: "cursor", ID: "saved-same-id", FileName: "saved-same-id.json", StorageJSON: []byte(`{"type":"cursor"}`)}}, nil
+	}}
+	host := pluginhost.New()
+	host.RegisterPluginForTest("concurrent-cursor", pluginapi.Plugin{Capabilities: pluginapi.Capabilities{AuthProvider: provider}})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+	h.SetPluginHost(host)
+	h.tokenStore = &pluginLoginRollbackStore{}
+	h.postAuthPersistHook = func(context.Context, *coreauth.Auth) error { close(saveEntered); <-releaseSave; return nil }
+	router := gin.New()
+	router.GET("/status", h.GetAuthStatus)
+	t.Cleanup(func() {
+		select {
+		case <-releasePoll:
+		default:
+			close(releasePoll)
+		}
+		select {
+		case <-releaseSave:
+		default:
+			close(releaseSave)
+		}
+	})
+	winner := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(winner, httptest.NewRequest(http.MethodGet, "/status?state=concurrent-proof", nil))
+		close(done)
+	}()
+	select {
+	case <-pollEntered:
+	case <-time.After(time.Second):
+		t.Fatal("owner never entered PollLogin")
+	}
+	loser := httptest.NewRecorder()
+	router.ServeHTTP(loser, httptest.NewRequest(http.MethodGet, "/status?state=concurrent-proof", nil))
+	if !strings.Contains(loser.Body.String(), `"status":"wait"`) || calls.Load() != 1 {
+		t.Fatal("loser entered plugin or did not wait")
+	}
+	SetOAuthSessionError("concurrent-proof", "unowned poll error")
+	close(releasePoll)
+	select {
+	case <-saveEntered:
+	case <-time.After(time.Second):
+		t.Fatal("owner never entered save")
+	}
+	duringSave := httptest.NewRecorder()
+	router.ServeHTTP(duringSave, httptest.NewRequest(http.MethodGet, "/status?state=concurrent-proof", nil))
+	if !strings.Contains(duringSave.Body.String(), `"status":"wait"`) || calls.Load() != 1 {
+		t.Fatal("loser entered plugin while saving")
+	}
+	SetOAuthSessionError("concurrent-proof", "unowned save-time error")
+	close(releaseSave)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("owner never completed")
+	}
+	var got struct {
+		Status string   `json:"status"`
+		IDs    []string `json:"credential_ids"`
+	}
+	if err := json.Unmarshal(winner.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "ok" || !reflect.DeepEqual(got.IDs, []string{"saved-same-id"}) {
+		t.Fatalf("winner result=%s", winner.Body.String())
+	}
+	repeat := httptest.NewRecorder()
+	router.ServeHTTP(repeat, httptest.NewRequest(http.MethodGet, "/status?state=concurrent-proof", nil))
+	if repeat.Body.String() != winner.Body.String() || calls.Load() != 1 {
+		t.Fatal("completed replay changed proof or re-polled")
+	}
+}
+
+// This uses the actual management HTTP handler, plugin dispatch, persistence
+// adapter and CoreManager. Only the external login and token store are fakes.
+func TestPluginStatusHTTPBindsPersistedManagerIdentity(t *testing.T) {
+	for _, scenario := range []string{"same-id-reauth", "multiple-records", "save-failure", "missing-post-persist-id", "cancel-during-poll", "expire-during-poll"} {
+		t.Run(scenario, func(t *testing.T) {
+			sessions := newOAuthSessionStore(30 * time.Minute)
+			replaceOAuthSessionStoreForTest(t, sessions)
+			if err := sessions.RegisterPlugin("http-bound", "cursor", map[string]any{"private-login": "must-not-appear"}); err != nil {
+				t.Fatal(err)
+			}
+			manager := coreauth.NewManager(nil, nil, nil)
+			old, err := manager.Register(context.Background(), &coreauth.Auth{ID: "existing-id", Provider: "cursor", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "cursor"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tokenStore := &pluginLoginRollbackStore{}
+			if scenario == "save-failure" {
+				tokenStore.failAt = 1
+			}
+			polls := 0
+			external := &testAuthProvider{identifier: "cursor", pollLogin: func(context.Context, pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
+				polls++
+				if scenario == "cancel-during-poll" {
+					sessions.Cancel("http-bound")
+				}
+				if scenario == "expire-during-poll" {
+					sessions.mu.Lock()
+					s := sessions.sessions["http-bound"]
+					s.ExpiresAt = time.Now().Add(-time.Second)
+					sessions.sessions["http-bound"] = s
+					sessions.mu.Unlock()
+				}
+				records := []pluginapi.AuthData{{ID: "existing-id", FileName: "existing-id.json", Provider: "cursor", StorageJSON: []byte(`{"type":"cursor","access_token":"must-not-appear"}`)}}
+				if scenario == "multiple-records" {
+					records = append(records, pluginapi.AuthData{ID: "second-id", FileName: "second-id.json", Provider: "cursor", StorageJSON: []byte(`{"type":"cursor"}`)})
+				}
+				return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Auths: records}, nil
+			}}
+			host := pluginhost.New()
+			host.RegisterPluginForTest("http-cursor", pluginapi.Plugin{Capabilities: pluginapi.Capabilities{AuthProvider: external}})
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+			h.SetPluginHost(host)
+			h.tokenStore = tokenStore
+			h.SetPostAuthPersistHook(func(ctx context.Context, a *coreauth.Auth) error {
+				if scenario == "missing-post-persist-id" {
+					a.ID = ""
+					return nil
+				}
+				_, e := manager.Register(ctx, a)
+				return e
+			})
+			router := gin.New()
+			router.GET("/status", h.GetAuthStatus)
+			server := httptest.NewServer(router)
+			defer server.Close()
+			read := func() map[string]json.RawMessage {
+				t.Helper()
+				response, e := http.Get(server.URL + "/status?state=http-bound")
+				if e != nil {
+					t.Fatal(e)
+				}
+				defer func() {
+					if e := response.Body.Close(); e != nil {
+						t.Error(e)
+					}
+				}()
+				var got map[string]json.RawMessage
+				if e := json.NewDecoder(response.Body).Decode(&got); e != nil {
+					t.Fatal(e)
+				}
+				raw, e := json.Marshal(got)
+				if e != nil {
+					t.Fatal(e)
+				}
+				if strings.Contains(string(raw), "must-not-appear") {
+					t.Fatal("private login or token leaked")
+				}
+				return got
+			}
+			first := read()
+			success := scenario == "same-id-reauth" || scenario == "multiple-records"
+			if success {
+				want := []string{"existing-id"}
+				if scenario == "multiple-records" {
+					want = append(want, "second-id")
+				}
+				var ids []string
+				if err := json.Unmarshal(first["credential_ids"], &ids); err != nil {
+					t.Fatal(err)
+				}
+				if string(first["status"]) != `"ok"` || string(first["provider"]) != `"cursor"` || !reflect.DeepEqual(ids, want) || len(first) != 3 {
+					t.Fatalf("status contract: %#v", first)
+				}
+				for _, id := range ids {
+					if _, exists := manager.GetByID(id); !exists {
+						t.Fatal("response ID not authoritative in CoreManager")
+					}
+				}
+				current, _ := manager.GetByID("existing-id")
+				if current.RegistrationEpoch <= old.RegistrationEpoch {
+					t.Fatal("same existing ID was not reauthenticated")
+				}
+				repeat := read()
+				if !reflect.DeepEqual(first, repeat) || polls != 1 {
+					t.Fatal("repeat repolled or changed IDs")
+				}
+			} else {
+				if string(first["status"]) != `"error"` || first["credential_ids"] != nil || first["provider"] != nil {
+					t.Fatalf("failed/cancelled save exposed identity: %#v", first)
+				}
+				if scenario == "missing-post-persist-id" && len(tokenStore.deleted) != 0 {
+					t.Fatal("missing identity destructively rolled back")
+				}
+			}
+		})
+	}
+}
+
+// Executed only by the owned Gateway component contract test. This is the same
+// maintained handler/CoreManager fixture across a real loopback HTTP boundary;
+// stdin EOF closes it normally, and the caller owns a hard process deadline.
+func TestPluginStatusGatewayConsumerBridge(t *testing.T) {
+	if os.Getenv("CURSOR_GATEWAY_CONSUMER_BRIDGE") != "1" {
+		t.Skip("requires owned Gateway integration runner")
+	}
+	sessions := newOAuthSessionStore(30 * time.Minute)
+	replaceOAuthSessionStoreForTest(t, sessions)
+	if err := sessions.RegisterPlugin("pricing-state", "cursor", nil); err != nil {
+		t.Fatal(err)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	dir := t.TempDir()
+	register := func(ctx context.Context, a *coreauth.Auth) error {
+		a.Attributes = map[string]string{"path": filepath.Join(dir, "fixture.json")}
+		if _, err := manager.Register(ctx, a); err != nil {
+			return err
+		}
+		registry.GetGlobalRegistry().RegisterClient(a.ID, "cursor", []*registry.ModelInfo{{ID: "cursor/cursor-grok-4.5-high", OwnedBy: "cursor", Type: "cursor"}})
+		return nil
+	}
+	if err := register(context.Background(), &coreauth.Auth{ID: "existing-id", FileName: "fixture.json", Provider: "cursor", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "cursor"}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("existing-id") })
+	external := &testAuthProvider{identifier: "cursor", pollLogin: func(context.Context, pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
+		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Auth: pluginapi.AuthData{ID: "existing-id", FileName: "fixture.json", Provider: "cursor", StorageJSON: []byte(`{"type":"cursor"}`)}}, nil
+	}}
+	host := pluginhost.New()
+	host.RegisterPluginForTest("bridge-cursor", pluginapi.Plugin{Capabilities: pluginapi.Capabilities{AuthProvider: external}})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: dir}, manager)
+	h.SetPluginHost(host)
+	h.tokenStore = &pluginLoginRollbackStore{}
+	h.SetPostAuthPersistHook(register)
+	router := gin.New()
+	router.GET("/v8/management/oauth/status", h.GetAuthStatus)
+	router.GET("/v8/management/credentials", h.ListAuthFiles)
+	router.GET("/v0/management/auth-files/models", h.GetAuthFileModels)
+	server := httptest.NewServer(router)
+	defer server.Close()
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]string{"bridge_url": server.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, os.Stdin); err != nil {
+		t.Fatal(err)
 	}
 }

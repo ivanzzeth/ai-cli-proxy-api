@@ -32,14 +32,22 @@ var (
 	errOAuthSessionExists     = errors.New("oauth session already exists")
 )
 
+// A claim is process-local and unique to one poll/save owner, never serialized.
+type oauthPluginCompletionClaim struct {
+	state, provider string
+	metadata        map[string]any
+}
+
 type oauthSession struct {
-	Provider  string
-	Status    string
-	Source    string
-	Metadata  map[string]any
-	Completed bool
-	CreatedAt time.Time
-	ExpiresAt time.Time
+	Provider      string
+	Status        string
+	Source        string
+	Metadata      map[string]any
+	Completed     bool
+	PluginClaim   *oauthPluginCompletionClaim
+	CredentialIDs []string
+	CreatedAt     time.Time
+	ExpiresAt     time.Time
 }
 
 type oauthSessionStore struct {
@@ -138,7 +146,7 @@ func (s *oauthSessionStore) SetError(state, message string) {
 
 	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
-	if !ok || session.Completed {
+	if !ok || session.Completed || session.PluginClaim != nil {
 		return
 	}
 	session.Status = message
@@ -158,7 +166,7 @@ func (s *oauthSessionStore) Complete(state string) {
 
 	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
-	if !ok || session.Completed {
+	if !ok || session.Completed || session.PluginClaim != nil {
 		return
 	}
 	session.Status = ""
@@ -166,6 +174,90 @@ func (s *oauthSessionStore) Complete(state string) {
 	session.Completed = true
 	session.ExpiresAt = now.Add(s.completedTTL)
 	s.sessions[state] = session
+}
+
+// ClaimPluginCompletion owns PollLogin and persistence as one operation.
+func (s *oauthSessionStore) ClaimPluginCompletion(state, provider string) *oauthPluginCompletionClaim {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked(time.Now())
+	state, provider = strings.TrimSpace(state), strings.TrimSpace(provider)
+	session, ok := s.sessions[state]
+	if !ok || session.Source != oauthSessionSourcePlugin || session.Completed || session.PluginClaim != nil || session.Status != "" || !strings.EqualFold(session.Provider, provider) {
+		return nil
+	}
+	claim := &oauthPluginCompletionClaim{state: state, provider: provider, metadata: cloneOAuthSessionMetadata(session.Metadata)}
+	session.PluginClaim = claim
+	s.sessions[state] = session
+	return claim
+}
+
+func (s *oauthSessionStore) pluginClaimSessionLocked(claim *oauthPluginCompletionClaim) (oauthSession, bool) {
+	if claim == nil {
+		return oauthSession{}, false
+	}
+	s.purgeExpiredLocked(time.Now())
+	session, ok := s.sessions[claim.state]
+	return session, ok && session.PluginClaim == claim && session.Source == oauthSessionSourcePlugin && !session.Completed && session.Status == "" && strings.EqualFold(session.Provider, claim.provider)
+}
+
+// ReleasePluginCompletion permits a later poll only while the same claim is pending.
+func (s *oauthSessionStore) ReleasePluginCompletion(claim *oauthPluginCompletionClaim) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.pluginClaimSessionLocked(claim)
+	if !ok {
+		return
+	}
+	session.PluginClaim = nil
+	s.sessions[claim.state] = session
+}
+
+// FailPluginCompletion can only change the state held by this exact owner.
+func (s *oauthSessionStore) FailPluginCompletion(claim *oauthPluginCompletionClaim, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.pluginClaimSessionLocked(claim)
+	if !ok {
+		return
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "Authentication failed"
+	}
+	session.Status, session.PluginClaim = message, nil
+	session.ExpiresAt = time.Now().Add(s.ttl)
+	s.sessions[claim.state] = session
+}
+
+// CompletePlugin binds only successfully persisted IDs; replay never extends TTL.
+func (s *oauthSessionStore) CompletePlugin(claim *oauthPluginCompletionClaim, ids []string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.pluginClaimSessionLocked(claim)
+	if !ok {
+		return false
+	}
+	seen := map[string]bool{}
+	bound := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return false
+		}
+		if !seen[id] {
+			seen[id] = true
+			bound = append(bound, id)
+		}
+	}
+	if len(bound) == 0 {
+		return false
+	}
+	session.Status, session.Metadata, session.Completed, session.PluginClaim = "", nil, true, nil
+	session.CredentialIDs = bound
+	session.ExpiresAt = time.Now().Add(s.completedTTL)
+	s.sessions[claim.state] = session
+	return true
 }
 
 func (s *oauthSessionStore) CompleteProvider(provider string, source string) int {
@@ -182,7 +274,7 @@ func (s *oauthSessionStore) CompleteProvider(provider string, source string) int
 	s.purgeExpiredLocked(now)
 	removed := 0
 	for state, session := range s.sessions {
-		if !session.Completed && strings.EqualFold(session.Provider, provider) && (source == "" || session.Source == source) {
+		if !session.Completed && session.PluginClaim == nil && strings.EqualFold(session.Provider, provider) && (source == "" || session.Source == source) {
 			session.Status = ""
 			session.Metadata = nil
 			session.Completed = true
@@ -204,6 +296,7 @@ func (s *oauthSessionStore) Get(state string) (oauthSession, bool) {
 	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
 	session.Metadata = cloneOAuthSessionMetadata(session.Metadata)
+	session.CredentialIDs = append([]string(nil), session.CredentialIDs...)
 	return session, ok
 }
 
@@ -272,6 +365,16 @@ func RegisterPluginOAuthSession(state, provider string, metadata map[string]any)
 func SetOAuthSessionError(state, message string) { oauthSessions.SetError(state, message) }
 
 func CompleteOAuthSession(state string) { oauthSessions.Complete(state) }
+
+func completedOAuthStatusResponse(state string) map[string]any {
+	result := map[string]any{"status": "ok"}
+	session, ok := oauthSessions.Get(state)
+	if ok && session.Completed && session.Source == oauthSessionSourcePlugin && len(session.CredentialIDs) > 0 {
+		result["provider"] = session.Provider
+		result["credential_ids"] = session.CredentialIDs
+	}
+	return result
+}
 
 func CompleteOAuthSessionsByProvider(provider string) int {
 	return oauthSessions.CompleteProvider(provider, oauthSessionSourceBuiltin)
