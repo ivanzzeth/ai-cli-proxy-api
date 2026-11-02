@@ -94,6 +94,11 @@ func (h *BaseAPIHandler) PrepareStreamModelRoute(ctx context.Context, handlerTyp
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	validated, failure := h.ValidateServerCredentialPinContext(ctx)
+	if failure != nil {
+		return context.WithValue(ctx, serverCredentialPinErrorKey{}, failure), false
+	}
+	ctx = validated
 	decision := h.applyModelRouter(ctx, handlerType, modelName, rawJSON, true, modelExecutionOptions{})
 	ctx = context.WithValue(ctx, preparedModelRouteContextKey{}, decision)
 	hasOverride := strings.TrimSpace(decision.ExecutorPluginID) != "" || strings.TrimSpace(decision.Provider) != ""

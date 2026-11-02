@@ -1669,3 +1669,49 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_SingleChunkWithBo
 		t.Fatalf("unexpected completed message: got %q", got)
 	}
 }
+
+func TestReasoningOnlyExplicitFinishPreservesTerminalEvidence(t *testing.T) {
+	for _, reason := range []string{"stop", "length", "", "tool_calls", "function_call", "unknown", "content_filter"} {
+		t.Run(reason, func(t *testing.T) {
+			request := []byte(`{"model":"deepseek-v4-flash"}`)
+			chunks := []string{
+				`data: {"id":"reason-only","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"synthetic thinking"},"finish_reason":null}]}`,
+				fmt.Sprintf(`data: {"id":"reason-only","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":%q}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, reason),
+				`data: [DONE]`,
+			}
+			var state any
+			terminalCount := 0
+			for i, line := range chunks {
+				for _, wire := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "deepseek-v4-flash", request, request, []byte(line), &state) {
+					name, data := parseOpenAIResponsesSSEEvent(t, wire)
+					if name != "response.completed" && name != "response.incomplete" {
+						continue
+					}
+					terminalCount++
+					if reason != "stop" && reason != "length" {
+						t.Fatal("unsupported reasoning-only finish was completed")
+					}
+					if i != 2 {
+						t.Fatal("terminal was emitted before DONE")
+					}
+					expected := "response.completed"
+					if reason == "length" {
+						expected = "response.incomplete"
+					}
+					if name != expected {
+						t.Fatalf("terminal %s want %s", name, expected)
+					}
+					if data.Get("response.output.0.type").String() != "reasoning" || data.Get("response.output.#").Int() != 1 {
+						t.Fatal("fabricated non-reasoning output")
+					}
+					if data.Get("response.usage.input_tokens").Int() != 10 || data.Get("response.usage.output_tokens").Int() != 5 {
+						t.Fatal("native usage was changed")
+					}
+				}
+			}
+			if (reason == "stop" || reason == "length") && terminalCount != 1 {
+				t.Fatalf("terminal count %d", terminalCount)
+			}
+		})
+	}
+}

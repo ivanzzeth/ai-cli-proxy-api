@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +18,9 @@ const (
 )
 
 type modelExecutionOptions struct {
+	NativeVoiceOperation coreexecutor.NativeVoiceHTTPOperation
+	SingleAttempt        bool
+
 	Headers                 http.Header
 	Query                   url.Values
 	InternalSource          bool
@@ -29,6 +33,9 @@ type modelExecutionOptions struct {
 
 // ProtocolExecutionRequest describes a route-level model execution request with explicit protocols.
 type ProtocolExecutionRequest struct {
+	NativeVoiceOperation coreexecutor.NativeVoiceHTTPOperation
+	SingleAttempt        bool
+
 	EntryProtocol      string
 	ExitProtocol       string
 	ForcedProvider     string
@@ -170,19 +177,21 @@ func (h *BaseAPIHandler) ExecuteProtocolWithAuthManager(ctx context.Context, req
 	if req.Stream {
 		return ModelExecutionResponse{}, modelExecutionModeError("ExecuteProtocolWithAuthManager requires Stream=false")
 	}
-	body, headers, errMsg := h.executeWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, false, modelExecutionOptions{
-		Headers:            req.Headers,
-		Query:              req.Query,
-		ForcedProvider:     req.ForcedProvider,
-		AuthSelectionModel: req.AuthSelectionModel,
+	response, errMsg := h.executeResponseWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, false, modelExecutionOptions{
+		NativeVoiceOperation: req.NativeVoiceOperation,
+		SingleAttempt:        req.SingleAttempt,
+		Headers:              req.Headers,
+		Query:                req.Query,
+		ForcedProvider:       req.ForcedProvider,
+		AuthSelectionModel:   req.AuthSelectionModel,
 	})
 	if errMsg != nil {
 		return ModelExecutionResponse{}, errMsg
 	}
 	return ModelExecutionResponse{
-		StatusCode: http.StatusOK,
-		Headers:    cloneHeader(headers),
-		Body:       cloneBytes(body),
+		StatusCode: response.StatusCode,
+		Headers:    cloneHeader(response.Headers),
+		Body:       cloneBytes(response.Payload),
 	}, nil
 }
 

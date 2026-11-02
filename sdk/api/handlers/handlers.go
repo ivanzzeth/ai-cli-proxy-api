@@ -486,6 +486,8 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		requestCtx = c.Request.Context()
 	}
 
+	parentCtx = bridgeServerCredentialPin(parentCtx, requestCtx)
+
 	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {
 		if requestID := logging.GetRequestID(requestCtx); requestID != "" {
 			parentCtx = logging.WithRequestID(parentCtx, requestID)

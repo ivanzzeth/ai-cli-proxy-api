@@ -111,6 +111,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return
 	}
 	if h.authManager == nil {
+		// Keep native disk fallback behavior while adding an explicit empty projection.
 		h.listAuthFilesFromDisk(c, pagination)
 		return
 	}
@@ -149,7 +150,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 				files = append(files, entry)
 			}
 		}
-		c.JSON(200, authFilesListResponse(observedAt, files, pagination, total, end))
+		response := authFilesListResponse(observedAt, files, pagination, total, end)
+		response["execution_credentials"] = h.buildExecutionCredentials()
+		c.JSON(200, response)
 		return
 	}
 	files := make([]gin.H, 0, len(auths))
@@ -170,7 +173,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	c.JSON(200, gin.H{"observed_at": observedAt, "files": files})
+	c.JSON(200, gin.H{"observed_at": observedAt, "files": files, "execution_credentials": h.buildExecutionCredentials()})
 }
 
 func parseAuthFilesPagination(c *gin.Context) (authFilesPagination, error) {
@@ -216,7 +219,7 @@ func (p authFilesPagination) bounds(total int) (int, int) {
 }
 
 func authFilesListResponse(observedAt time.Time, files []gin.H, pagination authFilesPagination, total, end int) gin.H {
-	response := gin.H{"observed_at": observedAt, "files": files}
+	response := gin.H{"observed_at": observedAt, "files": files, "execution_credentials": []executionCredential{}}
 	if pagination.enabled {
 		response["total"] = total
 		response["page"] = pagination.page

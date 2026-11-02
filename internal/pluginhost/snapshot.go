@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 type capabilityRecord struct {
@@ -26,14 +27,16 @@ type Snapshot struct {
 
 // RegisteredPluginInfo describes a plugin that is active in the current runtime snapshot.
 type RegisteredPluginInfo struct {
-	ID            string
-	Priority      int
-	Metadata      pluginapi.Metadata
-	SupportsOAuth bool
-	OAuthProvider string
-	SupportsQuota bool
-	QuotaProvider string
-	Menus         []RegisteredPluginMenu
+	ID       string
+	Priority int
+	Metadata pluginapi.Metadata
+	// CompatibleEndpoints covers OAuth-scoped execution in both response modes.
+	CompatibleEndpoints []string
+	SupportsOAuth       bool
+	OAuthProvider       string
+	SupportsQuota       bool
+	QuotaProvider       string
+	Menus               []RegisteredPluginMenu
 }
 
 // RegisteredPluginMenu describes a plugin-owned resource menu entry.
@@ -90,14 +93,15 @@ func (h *Host) RegisteredPlugins() []RegisteredPluginInfo {
 			}
 		}
 		out = append(out, RegisteredPluginInfo{
-			ID:            record.id,
-			Priority:      record.priority,
-			Metadata:      clonePluginMetadata(record.meta),
-			SupportsOAuth: authProvider != nil,
-			OAuthProvider: oauthProvider,
-			SupportsQuota: quotaProvider != nil,
-			QuotaProvider: quotaIdentifier,
-			Menus:         menusByPlugin[record.id],
+			ID:                  record.id,
+			Priority:            record.priority,
+			Metadata:            clonePluginMetadata(record.meta),
+			CompatibleEndpoints: h.compatibleOAuthEndpoints(record),
+			SupportsOAuth:       authProvider != nil,
+			OAuthProvider:       oauthProvider,
+			SupportsQuota:       quotaProvider != nil,
+			QuotaProvider:       quotaIdentifier,
+			Menus:               menusByPlugin[record.id],
 		})
 	}
 	return out
@@ -171,6 +175,47 @@ func cloneConfigFields(fields []pluginapi.ConfigField) []pluginapi.ConfigField {
 	copy(out, fields)
 	for index := range out {
 		out[index].EnumValues = append([]string(nil), fields[index].EnumValues...)
+	}
+	return out
+}
+
+// compatibleOAuthEndpoints projects the same ordered input/output choice used by
+// executorAdapter. Registration and pricing are separate evidence, required by callers.
+// A generic ResponseTranslator capability alone cannot prove either concrete mode.
+func (h *Host) compatibleOAuthEndpoints(record capabilityRecord) []string {
+	out := []string{}
+	caps := record.plugin.Capabilities
+	if !h.recordCurrent(record) || h.isPluginFused(record.id) || caps.Executor == nil || !executorScopeAllowsOAuthModels(caps) {
+		return out
+	}
+	adapter := &executorAdapter{
+		host: h, pluginID: record.id, path: record.path, version: record.version,
+		provider: record.id, executor: caps.Executor,
+		inputFormats:  normalizeExecutorFormats(caps.ExecutorInputFormats),
+		outputFormats: normalizeExecutorFormats(caps.ExecutorOutputFormats),
+	}
+	for _, entry := range []struct {
+		path   string
+		format sdktranslator.Format
+	}{
+		{"/v1/chat/completions", sdktranslator.FormatOpenAI},
+		{"/v1/messages", sdktranslator.FormatClaude},
+	} {
+		input, err := adapter.selectExecutorInputFormat(entry.format)
+		if err != nil {
+			continue
+		}
+		output, err := adapter.selectExecutorOutputFormat(entry.format, input)
+		if err != nil {
+			continue
+		}
+		if output != entry.format && (!sdktranslator.HasStreamResponseTransformer(entry.format, output) || !sdktranslator.HasNonStreamResponseTransformer(entry.format, output)) {
+			continue
+		}
+		out = append(out, entry.path)
+	}
+	if !h.recordCurrent(record) || h.isPluginFused(record.id) {
+		return []string{}
 	}
 	return out
 }

@@ -1,160 +1,258 @@
 package cliproxy
 
 import (
+	"bufio"
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
-func TestServiceShutdown_ViolentShutdownImmediatelyClosesServer(t *testing.T) {
-	ln, errListen := net.Listen("tcp", "127.0.0.1:0")
-	if errListen != nil {
-		t.Fatalf("failed to listen: %v", errListen)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if errClose := ln.Close(); errClose != nil {
-		t.Fatalf("failed to close listener: %v", errClose)
-	}
+type shutdownContextProvider struct{ loaded chan context.Context }
 
-	cfg := &config.Config{
-		Host: "127.0.0.1",
-		Port: port,
-	}
+func (p *shutdownContextProvider) Load(ctx context.Context, _ *sdkconfig.Config) (*APIKeyClientResult, error) {
+	p.loaded <- ctx
+	return &APIKeyClientResult{}, nil
+}
 
-	server := api.NewServer(cfg, nil, nil, "")
-	go func() {
-		_ = server.Start()
-	}()
-
-	// Wait briefly for server to bind.
-	var conn net.Conn
-	var errDial error
-	for i := 0; i < 20; i++ {
-		conn, errDial = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-		if errDial == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if errDial != nil {
-		t.Fatalf("server failed to start listening: %v", errDial)
-	}
-	defer func() {
+func waitServiceListener(t *testing.T, address string, accept bool) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		conn, err := net.DialTimeout("tcp", address, 50*time.Millisecond)
 		if conn != nil {
-			if errCloseConn := conn.Close(); errCloseConn != nil {
-				t.Logf("connection close error: %v", errCloseConn)
+			if e := conn.Close(); e != nil {
+				t.Log(e)
 			}
 		}
-	}()
-
-	service := &Service{
-		server: server,
-		cfg:    cfg,
-	}
-
-	stopStart := time.Now()
-	errShutdown := service.Shutdown(context.Background())
-	stopDuration := time.Since(stopStart)
-
-	if stopDuration >= time.Second {
-		t.Fatalf("service.Shutdown took %v, want immediate violent shutdown (<1s)", stopDuration)
-	}
-	if errShutdown != nil {
-		t.Fatalf("service.Shutdown error = %v, want nil", errShutdown)
-	}
-
-	// Verify server port is closed.
-	conn2, errDial2 := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if errDial2 == nil {
-		_ = conn2.Close()
-		t.Fatal("expected server to be closed, but dial succeeded")
+		if (err == nil) == accept {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("listener accept=%v not observed", accept)
+		case <-ticker.C:
+		}
 	}
 }
 
-func TestServiceRun_ShutdownContextFreshAtExit(t *testing.T) {
-	ln, errListen := net.Listen("tcp", "127.0.0.1:0")
-	if errListen != nil {
-		t.Fatalf("failed to listen: %v", errListen)
+func startShutdownService(t *testing.T) (*Service, context.CancelFunc, <-chan error, context.Context, chan struct{}, string) {
+	t.Helper()
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if errClose := ln.Close(); errClose != nil {
-		t.Fatalf("failed to close listener: %v", errClose)
+	address := raw.Addr().String()
+	port := raw.Addr().(*net.TCPAddr).Port
+	if err = raw.Close(); err != nil {
+		t.Fatal(err)
 	}
-
-	authDir := t.TempDir()
-	cfg := &config.Config{
-		Host:    "127.0.0.1",
-		Port:    port,
-		AuthDir: authDir,
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err = os.WriteFile(path, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
 	}
-
-	cfgPath := filepath.Join(authDir, "config.yaml")
-	if errWrite := os.WriteFile(cfgPath, []byte("{}"), 0o644); errWrite != nil {
-		t.Fatalf("failed to write dummy config: %v", errWrite)
+	cfg := &config.Config{Host: "127.0.0.1", Port: port, AuthDir: dir}
+	provider := &shutdownContextProvider{loaded: make(chan context.Context, 1)}
+	release := make(chan struct{})
+	var runtimeCtx context.Context
+	service, err := NewBuilder().WithConfig(cfg).WithConfigPath(path).WithAPIKeyClientProvider(provider).WithServerOptions(api.WithEngineConfigurator(func(engine *gin.Engine) {
+		engine.GET("/fixture-stream", func(c *gin.Context) {
+			c.Header("Content-Type", "text/event-stream")
+			if _, err := io.WriteString(c.Writer, "data: first\n\n"); err != nil {
+				return
+			}
+			c.Writer.Flush()
+			select {
+			case <-release:
+			case <-runtimeCtx.Done():
+				return
+			}
+			if _, err := io.WriteString(c.Writer, "event: response.completed\ndata: [DONE]\n\n"); err != nil {
+				return
+			}
+			c.Writer.Flush()
+		})
+	})).Build()
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	service, errBuild := NewBuilder().
-		WithConfig(cfg).
-		WithConfigPath(cfgPath).
-		Build()
-	if errBuild != nil {
-		t.Fatalf("failed to build service: %v", errBuild)
-	}
-
 	runCtx, cancel := context.WithCancel(context.Background())
-
-	runDone := make(chan error, 1)
-	go func() {
-		runDone <- service.Run(runCtx)
-	}()
-
-	// Wait for server to accept connections.
-	var conn net.Conn
-	var errDial error
-	for i := 0; i < 50; i++ {
-		conn, errDial = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-		if errDial == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if errDial != nil {
-		cancel()
-		t.Fatalf("failed to dial service server: %v", errDial)
-	}
-	if errCloseConn := conn.Close(); errCloseConn != nil {
-		t.Logf("connection close error: %v", errCloseConn)
-	}
-
-	// Trigger stop.
-	stopStart := time.Now()
-	cancel()
-
+	done := make(chan error, 1)
+	go func() { done <- service.Run(runCtx) }()
 	select {
-	case errRun := <-runDone:
-		stopDuration := time.Since(stopStart)
-		if stopDuration >= 5*time.Second {
-			t.Fatalf("service.Run stop took %v, want fast shutdown", stopDuration)
-		}
-		if errRun != nil && !errors.Is(errRun, context.Canceled) {
-			t.Fatalf("unexpected service.Run error: %v", errRun)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for service.Run to exit")
+	case runtimeCtx = <-provider.loaded:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("runtime provider was not loaded")
 	}
+	waitServiceListener(t, address, true)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		cancel()
+	})
+	return service, cancel, done, runtimeCtx, release, address
+}
 
-	// Verify server port is closed.
-	connClosed, errDialClosed := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if errDialClosed == nil {
-		_ = connClosed.Close()
-		t.Fatal("expected server to be closed after Run exit, but dial succeeded")
+func TestServiceRunSignalDrainsHTTPBeforeCancellingRuntime(t *testing.T) {
+	t.Setenv("AI_ROUTER_SHUTDOWN_TIMEOUT", "5s")
+	_, cancel, done, runtimeCtx, release, address := startShutdownService(t)
+	response, err := http.Get("http://" + address + "/fixture-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			t.Log(err)
+		}
+	}()
+	reader := bufio.NewReader(response.Body)
+	if line, err := reader.ReadString('\n'); err != nil || line != "data: first\n" {
+		t.Fatalf("first event %q %v", line, err)
+	}
+	cancel()
+	waitServiceListener(t, address, false)
+	select {
+	case <-runtimeCtx.Done():
+		t.Fatal("signal cancelled runtime before admitted HTTP drained")
+	default:
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Run exited before terminal: %v", err)
+	default:
+	}
+	close(release)
+	body, err := io.ReadAll(reader)
+	if err != nil || !strings.Contains(string(body), "response.completed") || !strings.Contains(string(body), "[DONE]") {
+		t.Fatalf("terminal lost %s %v", body, err)
+	}
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not finish")
+	}
+	select {
+	case <-runtimeCtx.Done():
+	default:
+		t.Fatal("runtime not cancelled after drain")
+	}
+}
+
+func TestServiceRunConfiguredDrainBudgetExpiresWithoutFalseTerminal(t *testing.T) {
+	t.Setenv("AI_ROUTER_SHUTDOWN_TIMEOUT", "1ms")
+	_, cancel, done, _, _, address := startShutdownService(t)
+	response, err := http.Get("http://" + address + "/fixture-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			t.Log(err)
+		}
+	}()
+	reader := bufio.NewReader(response.Body)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("configured drain budget was ignored")
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Logf("expected expired-drain stream read: %v", err)
+	}
+	if strings.Contains(string(body), "response.completed") || strings.Contains(string(body), "[DONE]") {
+		t.Fatalf("timed-out drain invented completion: %s", body)
+	}
+}
+
+func TestServiceRunInternalCancellationStillExits(t *testing.T) {
+	t.Setenv("AI_ROUTER_SHUTDOWN_TIMEOUT", "15m")
+	service, _, done, runtimeCtx, _, address := startShutdownService(t)
+	service.cancelServiceRun()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("internal runtime cancellation no longer stops Run")
+	}
+	select {
+	case <-runtimeCtx.Done():
+	default:
+		t.Fatal("internal cancellation not propagated")
+	}
+	waitServiceListener(t, address, false)
+}
+
+func TestServiceRunInvalidShutdownBudgetFailsBeforeStartup(t *testing.T) {
+	for _, value := range []string{"0", "-1s", "invalid"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("AI_ROUTER_SHUTDOWN_TIMEOUT", value)
+			service := &Service{}
+			if err := service.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "AI_ROUTER_SHUTDOWN_TIMEOUT") {
+				t.Fatalf("invalid budget startup error: %v", err)
+			}
+		})
+	}
+}
+
+func TestServiceShutdownPropagatesCallerDeadline(t *testing.T) {
+	t.Setenv("AI_ROUTER_SHUTDOWN_TIMEOUT", "5s")
+	service, cancelRun, done, _, release, address := startShutdownService(t)
+	response, err := http.Get("http://" + address + "/fixture-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			t.Log(err)
+		}
+	}()
+	reader := bufio.NewReader(response.Body)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := service.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("active HTTP deadline error lost: %v", err)
+	}
+	close(release)
+	body, err := io.ReadAll(reader)
+	if err != nil || !strings.Contains(string(body), "[DONE]") {
+		t.Fatalf("deadline force-closed stream: %s %v", body, err)
+	}
+	cancelRun()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run failed to exit after explicit cancellation")
 	}
 }

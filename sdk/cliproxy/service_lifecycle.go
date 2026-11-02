@@ -36,7 +36,16 @@ func (s *Service) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, runCancel := context.WithCancel(ctx)
+	shutdownTimeout := 90 * time.Second
+	if raw := os.Getenv("AI_ROUTER_SHUTDOWN_TIMEOUT"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed <= 0 {
+			return fmt.Errorf("AI_ROUTER_SHUTDOWN_TIMEOUT must be a positive duration")
+		}
+		shutdownTimeout = parsed
+	}
+	signalCtx := ctx
+	ctx, runCancel := context.WithCancel(context.WithoutCancel(ctx))
 	s.homeMu.Lock()
 	s.runCancel = runCancel
 	s.homeMu.Unlock()
@@ -57,7 +66,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer shutdownCancel()
 		if errShutdown := s.Shutdown(shutdownCtx); errShutdown != nil {
 			log.Errorf("service shutdown returned error: %v", errShutdown)
@@ -208,15 +217,18 @@ func (s *Service) Run(ctx context.Context) error {
 	s.registerModelRefreshCallback()
 
 	select {
+	case <-signalCtx.Done():
+		log.Debug("service signal context cancelled, draining HTTP...")
+		return signalCtx.Err()
 	case <-ctx.Done():
-		log.Debug("service context cancelled, shutting down...")
+		log.Debug("service runtime context cancelled, shutting down...")
 		return ctx.Err()
 	case errServer := <-s.serverErr:
 		return errServer
 	}
 }
 
-// Shutdown stops background workers and immediately closes the HTTP server.
+// Shutdown drains ordinary HTTP/SSE before stopping background facilities.
 // It ensures all resources are properly cleaned up and connections are closed.
 // The shutdown is idempotent and can be called multiple times safely.
 //
@@ -233,6 +245,16 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		if ctx == nil {
 			ctx = context.Background()
+		}
+
+		// Drain ordinary HTTP/SSE before stopping auth, plugin and runtime facilities.
+		if s.server != nil {
+			if errStop := s.server.Stop(ctx); errStop != nil {
+				log.Errorf("error stopping API server: %v", errStop)
+				if shutdownErr == nil {
+					shutdownErr = errStop
+				}
+			}
 		}
 
 		s.homeLifecycleMu.Lock()
@@ -323,15 +345,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		// no legacy clients to persist
-
-		if s.server != nil {
-			if errStop := s.server.Stop(ctx); errStop != nil {
-				log.Errorf("error stopping API server: %v", errStop)
-				if shutdownErr == nil {
-					shutdownErr = errStop
-				}
-			}
-		}
 
 		if s.pluginHost != nil {
 			sdktranslator.SetPluginHooks(nil)

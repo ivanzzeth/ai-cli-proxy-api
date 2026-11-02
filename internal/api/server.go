@@ -398,10 +398,10 @@ func (s *Server) Start() error {
 	}
 }
 
-// Stop closes listeners and immediately shuts down the API server without waiting for active connections.
+// Stop closes listeners and drains admitted ordinary HTTP requests within ctx.
 //
 // Parameters:
-//   - ctx: Context passed for compatibility.
+//   - ctx: Deadline and cancellation budget for draining active HTTP requests.
 //
 // Returns:
 //   - error: An error if the server fails to stop
@@ -431,10 +431,10 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 
-	// Close the HTTP server immediately without graceful draining.
+	// Stop accepting and drain admitted ordinary HTTP/SSE before runtime cleanup.
 	var errCloseServer error
 	if s.server != nil {
-		errCloseServer = s.server.Close()
+		errCloseServer = s.server.Shutdown(ctx)
 		if errors.Is(errCloseServer, http.ErrServerClosed) || errors.Is(errCloseServer, net.ErrClosed) {
 			errCloseServer = nil
 		}
@@ -443,7 +443,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.codexLiveHandler.Close()
 	}
 	if errCloseServer != nil {
-		return fmt.Errorf("failed to shutdown HTTP server: %v", errCloseServer)
+		return fmt.Errorf("failed to shutdown HTTP server: %w", errCloseServer)
 	}
 
 	log.Debug("API server stopped")

@@ -28,6 +28,14 @@ func (h *BaseAPIHandler) ExecuteImageStreamWithAuthManager(ctx context.Context, 
 }
 
 func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	// A native Auth.ID pin has no equivalent plugin-executor identity contract.
+	// Refuse at actual plugin dispatch; never silently bypass or unpin it.
+	if pinnedAuthIDFromContext(ctx) != "" {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("native credential pin cannot use a plugin executor")}
+		close(errChan)
+		return nil, nil, errChan
+	}
 	if h.AuthManager != nil && h.AuthManager.HomeEnabled() {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("plugin executor routing is unavailable while Home is enabled")}
@@ -295,6 +303,14 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 }
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	validated, failure := h.ValidateServerCredentialPinContext(ctx)
+	if failure != nil {
+		errs := make(chan *interfaces.ErrorMessage, 1)
+		errs <- failure
+		close(errs)
+		return nil, nil, errs
+	}
+	ctx = validated
 	originalRequestedModel := modelName
 	routeDecision, preparedRoute := preparedModelRouteFromContext(ctx, execOptions.SkipRouterPluginID)
 	if !preparedRoute {

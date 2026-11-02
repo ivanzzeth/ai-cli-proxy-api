@@ -1193,3 +1193,27 @@ func TestExecuteModelStreamReturnsFilteredHeadersWhenPassthroughDisabled(t *test
 		t.Fatalf("Set-Cookie = %q, want filtered", stream.Headers.Get("Set-Cookie"))
 	}
 }
+
+func TestVoiceProtocolResponseStatusLegacyZeroAndActualSuccess(t *testing.T) {
+	for _, status := range []int{0, 201, 204} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			executor := &modelExecutionCaptureExecutor{provider: "voice-status", execute: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+				return coreexecutor.Response{StatusCode: status, Payload: []byte("raw"), Headers: http.Header{"Content-Type": []string{"audio/wav"}}}, nil
+			}}
+			handler := newModelExecutionHandler(t, "voice-status", executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
+			var intercepted, completed int
+			handler.SetPluginHost(&handlerInterceptorTestHost{interceptResponse: func(_ context.Context, request pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
+				intercepted = request.StatusCode
+				return pluginapi.ResponseInterceptResponse{Body: request.Body, Headers: request.ResponseHeaders}
+			}, completeRequest: func(_ context.Context, completion pluginapi.RequestCompletion) { completed = completion.StatusCode }})
+			response, err := handler.ExecuteProtocolWithAuthManager(context.Background(), ProtocolExecutionRequest{EntryProtocol: "openai", Model: "voice-status", Body: []byte(`{}`)})
+			expected := status
+			if expected == 0 {
+				expected = 200
+			}
+			if err != nil || response.StatusCode != expected || string(response.Body) != "raw" || intercepted != expected || completed != expected {
+				t.Fatalf("status=%d expected=%d err=%v", response.StatusCode, expected, err)
+			}
+		})
+	}
+}

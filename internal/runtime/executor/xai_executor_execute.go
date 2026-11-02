@@ -20,6 +20,9 @@ import (
 
 func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
+	if opts.NativeVoiceOperation != "" {
+		return e.executeVoiceHTTP(ctx, auth, req, opts)
+	}
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
 	}

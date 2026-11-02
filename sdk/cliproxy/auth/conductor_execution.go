@@ -19,6 +19,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
@@ -119,6 +120,12 @@ func preferredExecutionAttemptError(fallback, upstream error) error {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if opts.SingleAttempt && (!opts.NativeVoiceOperation.Valid() || !opts.NativeVoiceOperation.Unsafe()) {
+		return cliproxyexecutor.Response{}, &Error{Code: "invalid_voice_operation", Message: "single attempt is only supported for fixed unsafe Voice operations"}
+	}
+	if opts.NativeVoiceOperation != "" && m.HomeEnabled() {
+		return cliproxyexecutor.Response{}, &Error{Code: "voice_not_supported", Message: "Voice is not supported in Home mode"}
+	}
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
@@ -147,6 +154,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 		if hasUpstreamExecutionAttempt(errExec) {
 			preferredUpstreamErr = errExec
+			if opts.SingleAttempt {
+				return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(errExec)
+			}
 		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
@@ -594,7 +604,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				refreshCtx := newUpstreamAttemptContext(execCtx)
-				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
+				if refreshed, okRefresh := func() (*Auth, bool) {
+					if opts.SingleAttempt && hasUpstreamExecutionAttempt(errExec) {
+						return nil, false
+					}
+					return m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized)
+				}(); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
 					execCtx = newUpstreamAttemptContext(execCtx)
@@ -634,6 +649,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					m.recordAvailabilityNeutralResult(execCtx, result)
 				} else {
 					m.MarkResult(execCtx, result)
+				}
+				if opts.SingleAttempt && hasUpstreamExecutionAttempt(errExec) {
+					return cliproxyexecutor.Response{}, errExec
 				}
 				if okAction {
 					if isRequestScopedStop(action, okAction) {
@@ -2157,4 +2175,40 @@ func syncMetadataSessionToContext(ctx context.Context, metadata map[string]any) 
 	}
 	ctx = logging.WithClientRequestMetadata(ctx, clientMeta)
 	return util.WithSessionID(ctx, clientMeta.SessionID)
+}
+
+// SupportsVoiceHTTPTransport conservatively inspects the same native transport priority as execution.
+func (m *Manager) SupportsVoiceHTTPTransport(authID string) bool {
+	if m == nil || m.HomeEnabled() {
+		return false
+	}
+	auth, ok := m.GetByID(authID)
+	if !ok || auth == nil {
+		return false
+	}
+	raw := strings.TrimSpace(auth.ProxyURL)
+	if raw == "" {
+		if cfg := m.runtimeConfigSnapshot(); cfg != nil {
+			raw = strings.TrimSpace(cfg.ProxyURL)
+		}
+	}
+	var rt http.RoundTripper
+	if raw != "" {
+		transport, _, err := proxyutil.BuildHTTPTransport(raw)
+		if err != nil {
+			return false
+		}
+		if transport != nil {
+			defer transport.CloseIdleConnections()
+			rt = transport
+		}
+	}
+	if rt == nil {
+		rt = m.roundTripperFor(auth)
+	}
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	transport, ok := rt.(*http.Transport)
+	return ok && transport != nil
 }

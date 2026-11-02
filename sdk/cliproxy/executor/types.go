@@ -195,6 +195,9 @@ type WebSocketResponseObserver func(context.Context, WebSocketResponseEvent)
 
 // Options controls execution behavior for both streaming and non-streaming calls.
 type Options struct {
+	NativeVoiceOperation NativeVoiceHTTPOperation
+	SingleAttempt        bool
+
 	// Stream toggles streaming mode.
 	Stream bool
 	// Alt carries optional alternate format hint (e.g. SSE JSON key).
@@ -239,8 +242,41 @@ func ResponseFormatOrSource(opts Options) sdktranslator.Format {
 	return opts.SourceFormat
 }
 
+// NativeVoiceHTTPOperation is server-owned routing, never a caller-provided URL.
+type NativeVoiceHTTPOperation string
+
+const (
+	NativeVoiceTTS          NativeVoiceHTTPOperation = "tts"
+	NativeVoiceSTT          NativeVoiceHTTPOperation = "stt"
+	NativeVoiceCreate       NativeVoiceHTTPOperation = "voice_create"
+	NativeVoiceList         NativeVoiceHTTPOperation = "voice_list"
+	NativeVoiceGet          NativeVoiceHTTPOperation = "voice_get"
+	NativeVoiceAudio        NativeVoiceHTTPOperation = "voice_audio"
+	NativeVoicePatch        NativeVoiceHTTPOperation = "voice_patch"
+	NativeVoiceDelete       NativeVoiceHTTPOperation = "voice_delete"
+	NativeVoiceAuthIDHeader                          = "X-CLIProxy-Auth-ID"
+)
+
+func (op NativeVoiceHTTPOperation) Valid() bool {
+	switch op {
+	case NativeVoiceTTS, NativeVoiceSTT, NativeVoiceCreate, NativeVoiceList, NativeVoiceGet, NativeVoiceAudio, NativeVoicePatch, NativeVoiceDelete:
+		return true
+	}
+	return false
+}
+func (op NativeVoiceHTTPOperation) Unsafe() bool {
+	switch op {
+	case NativeVoiceTTS, NativeVoiceSTT, NativeVoiceCreate, NativeVoicePatch, NativeVoiceDelete:
+		return true
+	}
+	return false
+}
+
 // Response wraps either a full provider response or metadata for streaming flows.
 type Response struct {
+	// StatusCode zero preserves legacy200 responses.
+	StatusCode int
+
 	// Payload is the provider response in the executor format.
 	Payload []byte
 	// Metadata exposes optional structured data for translators.

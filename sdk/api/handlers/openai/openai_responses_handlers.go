@@ -583,6 +583,10 @@ func (h *OpenAIResponsesAPIHandler) prepareCodexOrphanDelegation(c *gin.Context,
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
+	if _, _, failure := h.PrepareServerCredentialPin(c); failure != nil {
+		h.WriteErrorResponse(c, failure)
+		return
+	}
 	rawJSON, err := handlers.ReadRequestBody(c)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {

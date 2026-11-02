@@ -850,3 +850,23 @@ func setPluginRawScalarValue(t *testing.T, node *yaml.Node, key, value string) {
 	}
 	t.Fatalf("plugin raw missing scalar key %q", key)
 }
+
+func TestListPluginsDisabledCompatibleEndpointsAreEmptyArray(t *testing.T) {
+	h := &Handler{cfg: &config.Config{Plugins: config.PluginsConfig{Enabled: false, Dir: t.TempDir(), Configs: map[string]config.PluginInstanceConfig{"configured": {}}}}}
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v8/management/plugins", nil)
+	h.ListPlugins(ctx)
+	var response struct {
+		Plugins []struct {
+			CompatibleEndpoints []string `json:"compatible_endpoints"`
+			EffectiveEnabled    bool     `json:"effective_enabled"`
+		} `json:"plugins"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusOK || len(response.Plugins) != 1 || response.Plugins[0].CompatibleEndpoints == nil || len(response.Plugins[0].CompatibleEndpoints) != 0 || response.Plugins[0].EffectiveEnabled {
+		t.Fatalf("unexpected metadata: %s", rec.Body.String())
+	}
+}

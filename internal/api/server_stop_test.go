@@ -1,9 +1,14 @@
 package api
 
 import (
+	"bufio"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"net/http"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,79 +16,117 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
-func TestServerStop_ViolentShutdownImmediatelyClosesWithoutContextDeadlineError(t *testing.T) {
+type shutdownObservedListener struct {
+	net.Listener
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (l *shutdownObservedListener) Close() error {
+	err := l.Listener.Close()
+	l.once.Do(func() { close(l.closed) })
+	return err
+}
+
+func stopTestStream(t *testing.T) (*Server, *bufio.Reader, chan struct{}, *shutdownObservedListener) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
-
-	// Create a listener on a random available port.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
+		t.Fatal(err)
 	}
-
-	port := ln.Addr().(*net.TCPAddr).Port
-
-	cfg := &config.Config{
-		Host: "127.0.0.1",
-		Port: port,
-	}
-
-	server := NewServer(cfg, nil, nil, "")
-	engine := gin.New()
-	reqStarted := make(chan struct{})
-	engine.GET("/slow", func(c *gin.Context) {
-		close(reqStarted)
-		time.Sleep(2 * time.Second)
-		c.String(http.StatusOK, "ok")
-	})
-	server.server.Handler = engine
-
-	// Start the server with the listener.
-	go func() {
-		_ = server.server.Serve(ln)
-	}()
-
-	// Start an in-flight request.
-	reqDone := make(chan error, 1)
-	go func() {
-		resp, errGet := http.Get("http://" + ln.Addr().String() + "/slow")
-		if errGet != nil {
-			reqDone <- errGet
+	ln := &shutdownObservedListener{Listener: raw, closed: make(chan struct{})}
+	server := NewServer(&config.Config{Host: "127.0.0.1", Port: raw.Addr().(*net.TCPAddr).Port}, nil, nil, "")
+	release := make(chan struct{})
+	server.server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, "data: first\n\n"); err != nil {
 			return
 		}
-		defer func() {
-			if errCloseBody := resp.Body.Close(); errCloseBody != nil {
-				t.Logf("response body close error: %v", errCloseBody)
-			}
-		}()
-		reqDone <- nil
-	}()
-
-	<-reqStarted
-
-	// Call server.Stop with an expired context (simulating the expired shutdown deadline).
-	// Under violent shutdown (s.server.Close), the server should immediately close in-flight
-	// connections without waiting and without returning context deadline exceeded.
-	expiredCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancel()
-
-	stopStart := time.Now()
-	errStop := server.Stop(expiredCtx)
-	stopDuration := time.Since(stopStart)
-
-	if stopDuration >= time.Second {
-		t.Fatalf("server.Stop took %v, want immediate violent shutdown (<1s)", stopDuration)
-	}
-	if errStop != nil {
-		t.Fatalf("server.Stop error = %v, want nil for violent shutdown", errStop)
-	}
-
-	// Verify the in-flight request was terminated / interrupted.
-	select {
-	case errReq := <-reqDone:
-		if errReq == nil {
-			t.Fatal("expected in-flight request to be interrupted/error, but it completed successfully")
+		w.(http.Flusher).Flush()
+		<-release
+		if _, err := io.WriteString(w, "event: response.completed\ndata: [DONE]\n\n"); err != nil {
+			return
 		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for in-flight request to be interrupted by server.Stop")
+		w.(http.Flusher).Flush()
+	})
+	served := make(chan error, 1)
+	go func() { served <- server.server.Serve(ln) }()
+	response, err := http.Get("http://" + ln.Addr().String() + "/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(response.Body)
+	line, err := reader.ReadString('\n')
+	if err != nil || line != "data: first\n" {
+		t.Fatalf("first event %q %v", line, err)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		if err := response.Body.Close(); err != nil {
+			t.Log(err)
+		}
+		if err := server.server.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Log(err)
+		}
+		select {
+		case err := <-served:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				t.Error(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("server goroutine did not exit")
+		}
+	})
+	return server, reader, release, ln
+}
+
+func TestServerStopDrainsAdmittedSSEBeforeReturning(t *testing.T) {
+	server, reader, release, ln := stopTestStream(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stopped := make(chan error, 1)
+	go func() { stopped <- server.Stop(ctx) }()
+	<-ln.closed
+	select {
+	case err := <-stopped:
+		t.Fatalf("Stop returned before stream completed: %v", err)
+	default:
+	}
+	conn, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+	if err == nil {
+		if e := conn.Close(); e != nil {
+			t.Log(e)
+		}
+		t.Fatal("shutdown still accepts new connections")
+	}
+	close(release)
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "response.completed") || !strings.Contains(string(body), "[DONE]") {
+		t.Fatalf("terminal missing: %s", body)
+	}
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServerStopPreservesExpiredDeadlineError(t *testing.T) {
+	server, reader, release, _ := stopTestStream(t)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := server.Stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop error=%v", err)
+	}
+	close(release)
+	body, err := io.ReadAll(reader)
+	if err != nil || !strings.Contains(string(body), "[DONE]") {
+		t.Fatalf("Stop deadline forcibly closed existing stream: %s %v", body, err)
 	}
 }

@@ -327,6 +327,15 @@ func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth, clientHeade
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs, clientHeaders...)
+	// A server-only routing pin must never reach an xAI upstream, including
+	// when a configured native custom header tries to reintroduce it.
+	if r != nil {
+		for name := range r.Header {
+			if strings.EqualFold(name, "X-CLIProxy-Auth-ID") {
+				delete(r.Header, name)
+			}
+		}
+	}
 }
 
 // applyXAIChatHeaders applies standard xAI headers for non-image/video chat
@@ -536,6 +545,11 @@ func preserveXAIResponsesOutputControls(body, source []byte, from sdktranslator.
 		}
 	case sdktranslator.FormatOpenAIResponse:
 		maxOutputTokens = gjson.GetBytes(source, "max_output_tokens")
+		// Preserve explicit Responses include intent after Codex translation.
+		// Other entry formats retain their existing translator defaults.
+		if include := gjson.GetBytes(source, "include"); include.Exists() {
+			body, _ = sjson.SetRawBytes(body, "include", []byte(include.Raw))
+		}
 	default:
 		return body
 	}

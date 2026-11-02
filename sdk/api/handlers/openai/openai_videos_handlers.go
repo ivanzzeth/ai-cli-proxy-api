@@ -322,11 +322,11 @@ func (h *OpenAIAPIHandler) bindVideoAuthID(videoID string, authID string, model 
 	videoAuthBindings.setWithModel(videoID, authID, routingXAIVideosModel(model), h.videoAuthBindingTTL())
 }
 
-func (h *OpenAIAPIHandler) contextWithVideoAuthBinding(ctx context.Context, videoID string) context.Context {
+func (h *OpenAIAPIHandler) contextWithVideoAuthBinding(ctx context.Context, videoID string) (context.Context, *interfaces.ErrorMessage) {
 	if authID, ok := videoAuthBindings.get(videoID); ok {
-		return handlers.WithPinnedAuthID(ctx, authID)
+		ctx = handlers.WithPinnedAuthID(ctx, authID)
 	}
-	return ctx
+	return h.ValidateServerCredentialPinContext(ctx)
 }
 
 func (h *OpenAIAPIHandler) modelWithVideoAuthBinding(videoID string, fallbackModel string) string {
@@ -788,7 +788,12 @@ func (h *OpenAIAPIHandler) VideosRetrieve(c *gin.Context) {
 	c.Header("Content-Type", "application/json")
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	selectedAuthID := ""
-	cliCtx = h.contextWithVideoAuthBinding(cliCtx, videoID)
+	cliCtx, bindingFailure := h.contextWithVideoAuthBinding(cliCtx, videoID)
+	if bindingFailure != nil {
+		h.WriteErrorResponse(c, bindingFailure)
+		cliCancel(bindingFailure.Error)
+		return
+	}
 	executionModel := h.modelWithVideoAuthBinding(videoID, defaultXAIVideosModel)
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
 		selectedAuthID = authID
@@ -851,7 +856,12 @@ func (h *OpenAIAPIHandler) VideosContent(c *gin.Context) {
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	selectedAuthID := ""
-	cliCtx = h.contextWithVideoAuthBinding(cliCtx, videoID)
+	cliCtx, bindingFailure := h.contextWithVideoAuthBinding(cliCtx, videoID)
+	if bindingFailure != nil {
+		h.WriteErrorResponse(c, bindingFailure)
+		cliCancel(bindingFailure.Error)
+		return
+	}
 	executionModel := h.modelWithVideoAuthBinding(videoID, defaultXAIVideosModel)
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
 		selectedAuthID = authID
@@ -979,7 +989,13 @@ func (h *OpenAIAPIHandler) collectXAIVideosNative(c *gin.Context, rawJSON []byte
 	videoID := videoIDFromPayload(rawJSON)
 	executionModel := model
 	if !bindCreatedVideoAuth {
-		cliCtx = h.contextWithVideoAuthBinding(cliCtx, videoID)
+		var bindingFailure *interfaces.ErrorMessage
+		cliCtx, bindingFailure = h.contextWithVideoAuthBinding(cliCtx, videoID)
+		if bindingFailure != nil {
+			h.WriteErrorResponse(c, bindingFailure)
+			cliCancel(bindingFailure.Error)
+			return
+		}
 		executionModel = h.modelWithVideoAuthBinding(videoID, model)
 	}
 	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {

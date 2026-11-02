@@ -43,18 +43,35 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 }
 
 func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	response, err := h.executeResponseWithAuthManagerFormats(ctx, entryProtocol, exitProtocol, modelName, rawJSON, alt, allowImageModel, execOptions)
+	return response.Payload, response.Headers, err
+}
+
+func (h *BaseAPIHandler) executeResponseWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (coreexecutor.Response, *interfaces.ErrorMessage) {
+	validated, failure := h.ValidateServerCredentialPinContext(ctx)
+	if failure != nil {
+		return coreexecutor.Response{}, failure
+	}
+	ctx = validated
+	if execOptions.NativeVoiceOperation != "" && !execOptions.NativeVoiceOperation.Valid() {
+		return coreexecutor.Response{}, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("unknown native voice operation")}
+	}
 	originalRequestedModel := modelName
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
 	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
-		return nil, nil, errMsg
+		return coreexecutor.Response{}, errMsg
 	}
 	if routeDecision.ExecutorPluginID != "" {
-		return h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
+		if execOptions.NativeVoiceOperation != "" {
+			return coreexecutor.Response{}, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("voice cannot use a plugin executor")}
+		}
+		body, headers, err := h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
+		return coreexecutor.Response{Payload: body, Headers: headers, StatusCode: http.StatusOK}, err
 	}
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
-		return nil, nil, errMsg
+		return coreexecutor.Response{}, errMsg
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
@@ -76,6 +93,8 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	lifecycle := h.newRequestLifecycleTracker(ctx, entryProtocol, normalizedModel, originalRequestedModel, false, reqMeta, execOptions.SkipInterceptorPluginID)
 	opts := coreexecutor.Options{
 		Stream:                      false,
+		NativeVoiceOperation:        execOptions.NativeVoiceOperation,
+		SingleAttempt:               execOptions.SingleAttempt,
 		Alt:                         alt,
 		OriginalRequest:             rawJSON,
 		SourceFormat:                sdktranslator.FromString(entryProtocol),
@@ -92,7 +111,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	req, opts, interceptErr = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, lifecycle.requestID(), req, opts, execOptions.SkipInterceptorPluginID)
 	if interceptErr != nil {
 		lifecycle.completeError(ctx, interceptErr)
-		return nil, nil, interceptErr
+		return coreexecutor.Response{}, interceptErr
 	}
 	ctx = enrichContextWithSessionHierarchy(ctx, opts.Headers, req.Payload, opts.Metadata)
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
@@ -100,16 +119,32 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errMsg := executionErrorMessage(err)
 		lifecycle.completeError(ctx, errMsg)
-		return nil, nil, errMsg
+		return coreexecutor.Response{}, errMsg
 	}
 	executedReq, executedOpts := afterAuthCapture.apply(req, opts)
 	ctx = enrichContextWithSessionHierarchy(ctx, executedOpts.Headers, executedReq.Payload, executedOpts.Metadata)
+	status := resp.StatusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
 	rawResponseHeaders := cloneHeader(resp.Headers)
-	passthroughHeaders := executionPassthroughHeaders(h.Cfg, execOptions.InternalSource)
+	passthroughHeaders := executionPassthroughHeaders(h.Cfg, execOptions.InternalSource) || execOptions.NativeVoiceOperation != ""
 	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, passthroughHeaders)
-	body, responseHeaders := h.applyResponseInterceptors(ctx, lifecycle.requestID(), responseProtocol, normalizedModel, originalRequestedModel, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, http.StatusOK, execOptions.SkipInterceptorPluginID, passthroughHeaders)
-	lifecycle.complete(pluginapi.RequestCompletionSucceeded, http.StatusOK, nil)
-	return body, responseHeaders, nil
+	body, responseHeaders := h.applyResponseInterceptors(ctx, lifecycle.requestID(), responseProtocol, normalizedModel, originalRequestedModel, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, status, execOptions.SkipInterceptorPluginID, passthroughHeaders)
+	if execOptions.NativeVoiceOperation != "" {
+		safe := make(http.Header)
+		for _, name := range []string{"Content-Type", "Retry-After", "Location", "X-Request-Id"} {
+			if value := responseHeaders.Get(name); value != "" {
+				safe.Set(name, value)
+			}
+		}
+		responseHeaders = safe
+	}
+	lifecycle.complete(pluginapi.RequestCompletionSucceeded, status, nil)
+	resp.Payload = body
+	resp.Headers = responseHeaders
+	resp.StatusCode = status
+	return resp, nil
 }
 
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
@@ -119,6 +154,11 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 }
 
 func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	validated, failure := h.ValidateServerCredentialPinContext(ctx)
+	if failure != nil {
+		return nil, nil, failure
+	}
+	ctx = validated
 	originalRequestedModel := modelName
 	routeDecision := h.applyModelRouter(ctx, handlerType, modelName, rawJSON, false, execOptions)
 	if routeDecision.ExecutorPluginID != "" {
@@ -183,6 +223,11 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 }
 
 func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	// A native Auth.ID pin has no equivalent plugin-executor identity contract.
+	// Refuse at actual plugin dispatch; never silently bypass or unpin it.
+	if pinnedAuthIDFromContext(ctx) != "" {
+		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("native credential pin cannot use a plugin executor")}
+	}
 	if h.AuthManager != nil && h.AuthManager.HomeEnabled() {
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("plugin executor routing is unavailable while Home is enabled")}
 	}
@@ -233,6 +278,9 @@ func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryPro
 }
 
 func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerType, modelName, originalRequestedModel string, rawJSON []byte, alt, executorPluginID string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	if pinnedAuthIDFromContext(ctx) != "" {
+		return nil, nil, serverCredentialPinError(http.StatusBadRequest, "native credential pin cannot use a plugin executor")
+	}
 	if h.AuthManager != nil && h.AuthManager.HomeEnabled() {
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: fmt.Errorf("plugin executor routing is unavailable while Home is enabled")}
 	}
@@ -360,6 +408,15 @@ func executionErrorMessage(err error) *interfaces.ErrorMessage {
 				contentType = "application/json"
 			}
 			headers = http.Header{"Content-Type": []string{contentType}}
+		}
+		var voiceHeaders interface{ VoiceHTTPResponseHeaders() http.Header }
+		if errors.As(err, &voiceHeaders) {
+			headers = make(http.Header)
+			for _, name := range []string{"Content-Type", "Retry-After", "Location", "X-Request-Id"} {
+				if value := voiceHeaders.VoiceHTTPResponseHeaders().Get(name); value != "" {
+					headers.Set(name, value)
+				}
+			}
 		}
 		return &interfaces.ErrorMessage{
 			StatusCode:     status,
