@@ -220,6 +220,16 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 
 func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (resp cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	profile, profileErr := e.seedreamProfile(auth, baseModel)
+	if profileErr != nil {
+		return resp, profileErr
+	}
+	attempted := false
+	defer func() {
+		if profile != "" && attempted && err != nil {
+			err = &seedreamAttemptError{}
+		}
+	}()
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -231,6 +241,12 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 	}
 
 	payload, contentType, errPrepare := prepareOpenAICompatImagesPayload(req.Payload, baseModel, opts.Headers.Get("Content-Type"), false)
+	if profile != "" {
+		if errPrepare != nil {
+			return resp, errPrepare
+		}
+		payload, errPrepare = normalizeSeedreamGeneration(payload, endpointPath, profile, baseModel)
+	}
 	if errPrepare != nil {
 		err = errPrepare
 		return resp, err
@@ -274,7 +290,19 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 	})
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	if profile != "" {
+		var closeIdle func()
+		httpClient, closeIdle, err = voiceSingleAttemptClient(httpClient) // transport-only reuse, no Voice operation
+		if err != nil {
+			return resp, err
+		}
+		defer closeIdle()
+		httpReq.GetBody = nil
+	}
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	if profile != "" {
+		attempted = true
+	}
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -301,6 +329,11 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 		return resp, err
 	}
 
+	if profile != "" {
+		if checkErr := verifySeedreamSingleResult(body, payload); checkErr != nil {
+			return resp, checkErr
+		}
+	}
 	reporter.ObserveResponseModel(body)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
 	reporter.EnsurePublished(ctx)
@@ -579,6 +612,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (_ *cliproxyexecutor.StreamResult, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	profile, profileErr := e.seedreamProfile(auth, baseModel)
+	if profileErr != nil {
+		return nil, profileErr
+	}
+	if profile != "" {
+		return nil, statusErr{code: 400, msg: "Seedream P1 is synchronous only"}
+	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)

@@ -873,3 +873,49 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolPreservesEarlierUpstreamError
 		t.Fatalf("stream error leaked internal upstream-attempt marker: %T/%v", chunk.Err, chunk.Err)
 	}
 }
+
+// Structural signal is issued by the native image executor only; it must cross
+// the existing execution boundary without auth refresh or credential/round replay.
+type seedreamStopTestError struct{ status int }
+
+func (e seedreamStopTestError) Error() string                   { return "synthetic committed image outcome unknown" }
+func (e seedreamStopTestError) StatusCode() int                 { return e.status }
+func (e seedreamStopTestError) NonReplayableImageAttempt() bool { return true }
+
+type seedreamStopTestExecutor struct {
+	*unauthorizedRefreshExecutor
+	status int
+}
+
+func (e *seedreamStopTestExecutor) Execute(_ context.Context, a *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.executeCalls = append(e.executeCalls, a.ID)
+	e.mu.Unlock()
+	return cliproxyexecutor.Response{}, seedreamStopTestError{status: e.status}
+}
+
+func TestSeedreamAttemptStopsRefreshCredentialAndRounds(t *testing.T) {
+	for _, status := range []int{401, 429, 502, 0} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			manager, base, primary, _, model := newUnauthorizedRefreshFixture(t, false)
+			executor := &seedreamStopTestExecutor{unauthorizedRefreshExecutor: base, status: status}
+			manager.RegisterExecutor(executor)
+			manager.SetRetryConfig(3, 0, 3)
+			response, err := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			var stop interface{ NonReplayableImageAttempt() bool }
+			if err == nil || !errors.As(err, &stop) || !stop.NonReplayableImageAttempt() {
+				t.Fatalf("lost typed stop: %v", err)
+			}
+			if len(response.Payload) != 0 {
+				t.Fatal("unknown image falsely completed")
+			}
+			calls := base.ExecuteCalls()
+			if len(calls) != 1 || calls[0] != primary.ID {
+				t.Fatalf("replayed or switched credential: %v", calls)
+			}
+			if base.RefreshCalls() != 0 {
+				t.Fatalf("refresh=%d", base.RefreshCalls())
+			}
+		})
+	}
+}

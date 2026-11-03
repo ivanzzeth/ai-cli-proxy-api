@@ -32,8 +32,29 @@ type NativeCapabilities struct {
 	WebSearch *bool `json:"web_search,omitempty"`
 }
 
+// ImageGenerationSupport is native per-model metadata, not a second product registry.
+type ImageGenerationSupport struct {
+	Profile            string   `json:"profile"`
+	SupportedEndpoints []string `json:"supported_endpoints"`
+	Sizes              []string `json:"sizes"`
+	MaxImages          int      `json:"max_images"`
+	Stream             bool     `json:"stream"`
+}
+
+// SeedreamImageProfile returns only explicitly supported, versioned contracts.
+// Binding a real vendor model to the selected profile remains an operator precondition.
+func SeedreamImageProfile(profile string) *ImageGenerationSupport {
+	switch profile {
+	case "ark-agent-plan-seedream-5pro-v1", "ark-agent-plan-seedream-5flash-v1":
+		return &ImageGenerationSupport{Profile: profile, SupportedEndpoints: []string{"/v1/images/generations"}, Sizes: []string{"1K", "2K"}, MaxImages: 1}
+	default:
+		return nil
+	}
+}
+
 // ModelInfo represents information about an available model
 type ModelInfo struct {
+	ImageGeneration *ImageGenerationSupport `json:"image_generation,omitempty"`
 	// ID is the unique identifier for the model
 	ID string `json:"id"`
 	// MetadataModelID identifies the canonical model used to resolve client metadata.
@@ -760,6 +781,12 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 		return nil
 	}
 	copyModel := *model
+	if model.ImageGeneration != nil {
+		cap := *model.ImageGeneration
+		cap.SupportedEndpoints = append([]string(nil), cap.SupportedEndpoints...)
+		cap.Sizes = append([]string(nil), cap.Sizes...)
+		copyModel.ImageGeneration = &cap
+	}
 	if model.NativeCapabilities != nil {
 		copyCapabilities := *model.NativeCapabilities
 		if model.NativeCapabilities.WebSearch != nil {
@@ -1662,6 +1689,9 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 			"id":       model.ID,
 			"object":   "model",
 			"owned_by": model.OwnedBy,
+		}
+		if model.ImageGeneration != nil {
+			result["image_generation"] = cloneModelInfo(model).ImageGeneration
 		}
 		if model.Created > 0 {
 			result["created"] = model.Created

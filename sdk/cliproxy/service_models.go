@@ -793,6 +793,9 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 		if len(model.InputModalities) > 0 {
 			info.ExplicitInputModalities = true
 		}
+		if model.Image {
+			info.ImageGeneration = registry.SeedreamImageProfile(model.ImageProfile)
+		}
 		info.Thinking = modelconfig.NormalizeThinkingSupport(thinkingSupport)
 		info.SupportedInputModalities = normalizeCompatConfigModalities(model.InputModalities)
 		info.SupportedOutputModalities = normalizeCompatConfigModalities(model.OutputModalities)

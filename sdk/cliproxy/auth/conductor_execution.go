@@ -117,6 +117,11 @@ func preferredExecutionAttemptError(fallback, upstream error) error {
 	return markUpstreamExecutionAttempt(upstream)
 }
 
+func nonReplayableImageAttempt(err error) bool {
+	var signal interface{ NonReplayableImageAttempt() bool }
+	return errors.As(err, &signal) && signal.NonReplayableImageAttempt()
+}
+
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -148,6 +153,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		resp, errExec := m.executeMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
 		if errExec == nil {
 			return resp, nil
+		}
+		if nonReplayableImageAttempt(errExec) {
+			return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(errExec)
 		}
 		if isRequestTerminatedError(errExec) || isRequestStopError(errExec) {
 			return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(errExec)
@@ -605,6 +613,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				refreshCtx := newUpstreamAttemptContext(execCtx)
 				if refreshed, okRefresh := func() (*Auth, bool) {
+					if nonReplayableImageAttempt(errExec) {
+						return nil, false
+					}
 					if opts.SingleAttempt && hasUpstreamExecutionAttempt(errExec) {
 						return nil, false
 					}
@@ -649,6 +660,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					m.recordAvailabilityNeutralResult(execCtx, result)
 				} else {
 					m.MarkResult(execCtx, result)
+				}
+				if nonReplayableImageAttempt(errExec) {
+					return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
 				}
 				if opts.SingleAttempt && hasUpstreamExecutionAttempt(errExec) {
 					return cliproxyexecutor.Response{}, errExec
