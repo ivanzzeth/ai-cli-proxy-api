@@ -56,6 +56,7 @@ type sseFrameAccumulator struct {
 }
 
 type xaiImageResult struct {
+	Size          string
 	B64JSON       string
 	URL           string
 	RevisedPrompt string
@@ -1095,6 +1096,10 @@ func extractXAIImagesResponse(payload []byte) (results []xaiImageResult, created
 				RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
 				MimeType:      strings.TrimSpace(item.Get("mime_type").String()),
 			}
+			// Preserve only an explicit upstream string; never infer output size.
+			if size := item.Get("size"); size.Type == gjson.String && size.String() != "" {
+				result.Size = size.String()
+			}
 			if result.MimeType == "" {
 				result.MimeType = mimeTypeFromOutputFormat(strings.TrimSpace(item.Get("output_format").String()))
 			}
@@ -1140,6 +1145,9 @@ func buildImagesAPIResponseFromXAI(payload []byte, responseFormat string) ([]byt
 			item, _ = sjson.SetBytes(item, "b64_json", img.B64JSON)
 		} else {
 			item, _ = sjson.SetBytes(item, "url", img.URL)
+		}
+		if img.Size != "" {
+			item, _ = sjson.SetBytes(item, "size", img.Size)
 		}
 		if img.RevisedPrompt != "" {
 			item, _ = sjson.SetBytes(item, "revised_prompt", img.RevisedPrompt)

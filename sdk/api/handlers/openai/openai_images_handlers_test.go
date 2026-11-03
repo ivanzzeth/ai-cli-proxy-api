@@ -585,3 +585,38 @@ func TestSSEFrameAccumulatorKeepsMultipleFramesDistinct(t *testing.T) {
 		t.Fatalf("frames were overwritten during buffer compaction: %q", frames)
 	}
 }
+
+func TestBuildImagesAPIResponsePreservesOnlyExplicitUpstreamSize(t *testing.T) {
+	for _, tc := range []struct {
+		name, sizeJSON, want string
+		exists               bool
+	}{
+		{"1K", `"1K"`, "1K", true}, {"2K", `"2K"`, "2K", true},
+		{"pixel size", `"2048x2048"`, "2048x2048", true},
+		{"invalid tier stays invalid", `"1.5K"`, "1.5K", true},
+		{"mismatched tier stays mismatched", `"2K"`, "2K", true},
+		{"empty", `""`, "", false}, {"null", `null`, "", false}, {"numeric", `1024`, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := []byte(`{"created":123,"size":"1K","data":[{"b64_json":"AA==","size":` + tc.sizeJSON + `}]}`)
+			out, err := buildImagesAPIResponseFromXAI(payload, "b64_json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := gjson.GetBytes(out, "data.0.size")
+			if got.Exists() != tc.exists || tc.exists && (got.Type != gjson.String || got.String() != tc.want) {
+				t.Fatalf("size not faithfully preserved: %s", out)
+			}
+		})
+	}
+	legacy := []byte(`{"created":123,"data":[{"b64_json":"AA=="}]}`)
+	out, err := buildImagesAPIResponseFromXAI(legacy, "b64_json")
+	if err != nil || !bytes.Equal(out, legacy) {
+		t.Fatalf("legacy no-size changed: %s / %v", out, err)
+	}
+	inputOnly := []byte(`{"created":123,"size":"2K","data":[{"b64_json":"AA=="}]}`)
+	out, err = buildImagesAPIResponseFromXAI(inputOnly, "b64_json")
+	if err != nil || gjson.GetBytes(out, "data.0.size").Exists() {
+		t.Fatal("invented per-item size from unrelated field")
+	}
+}
