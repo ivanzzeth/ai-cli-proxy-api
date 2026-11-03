@@ -97,6 +97,11 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 			filteredModel["owned_by"] = ownedBy
 		}
 
+		// Forward only the native registry's public image capability contract.
+		if support, exists := model["image_generation"]; exists && support != nil {
+			filteredModel["image_generation"] = support
+		}
+
 		filteredModels[i] = filteredModel
 	}
 

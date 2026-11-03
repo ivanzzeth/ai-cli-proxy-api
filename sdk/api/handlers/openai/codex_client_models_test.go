@@ -1,6 +1,12 @@
 package openai
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+
+	"github.com/gin-gonic/gin"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -295,5 +301,66 @@ func TestCodexClientModelsResponse_DevinDisplayName(t *testing.T) {
 		t.Fatal("missing standard-model entry")
 	} else if got, _ := std["display_name"].(string); got != "Standard Model" {
 		t.Errorf("standard-model display_name = %q, want Standard Model", got)
+	}
+}
+
+func TestOpenAIModelsPreservesPublicImageGenerationOnly(t *testing.T) {
+	const client = "task140-public-image-capability"
+	const flash = "doubao-seedream-5.0-flash"
+	const text = "task140-text-no-capability"
+	const generic = "task140-generic-image-no-profile"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(client, "openai-compatibility", []*registry.ModelInfo{
+		{ID: flash, Object: "model", Created: 1, OwnedBy: "fixture", ImageGeneration: registry.SeedreamImageProfile("ark-agent-plan-seedream-5flash-v1"), DisplayName: "must-not-leak", MetadataModelID: "must-not-leak"},
+		{ID: text, Object: "model", Created: 1, OwnedBy: "fixture", DisplayName: "must-not-leak", MetadataModelID: "must-not-leak"},
+		{ID: generic, Object: "model", Created: 1, OwnedBy: "fixture", Type: registry.OpenAIImageModelType},
+	})
+	t.Cleanup(func() { reg.UnregisterClient(client) })
+	h := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(&config.SDKConfig{}, nil))
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	h.OpenAIModels(c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	var body struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	rows := map[string]map[string]any{}
+	for _, row := range body.Data {
+		if id, ok := row["id"].(string); ok {
+			rows[id] = row
+		}
+	}
+	for _, id := range []string{flash, text, generic} {
+		t.Run(id, func(t *testing.T) {
+			row := rows[id]
+			if row == nil {
+				t.Fatal("missing configured model")
+			}
+			for key := range row {
+				if key != "id" && key != "object" && key != "created" && key != "owned_by" && key != "image_generation" {
+					t.Fatalf("unexpected public key %q", key)
+				}
+			}
+			support, exists := row["image_generation"]
+			if id != flash {
+				if exists {
+					t.Fatal("invented image profile")
+				}
+				if len(row) != 4 {
+					t.Fatal("legacy four fields changed")
+				}
+				return
+			}
+			expected := map[string]any{"profile": "ark-agent-plan-seedream-5flash-v1", "supported_endpoints": []any{"/v1/images/generations"}, "sizes": []any{"1K", "2K"}, "max_images": float64(1), "stream": false}
+			if !exists || !reflect.DeepEqual(support, expected) {
+				t.Fatal("public image generation contract incomplete")
+			}
+		})
 	}
 }
