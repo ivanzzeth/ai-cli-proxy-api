@@ -890,3 +890,81 @@ func BenchmarkScheduler_TargetedMarkResultHighConcurrency(b *testing.B) {
 		}
 	})
 }
+
+// This case intentionally uses only the pre-existing public registry/manager API,
+// so the unpatched baseline can demonstrate the behavioral failure (not a missing-field compile error).
+func TestManager_TransientCooldownCatalogRecoversWithoutNewExecution(t *testing.T) {
+	const clientID = "temporary-deadline-manager-fixture"
+	const model = "temporary-deadline-manager-model"
+	manager := NewManager(nil, nil, nil)
+	reg := registry.GetGlobalRegistry()
+	previous := transientErrorCooldownSeconds.Load()
+	SetTransientErrorCooldownSeconds(1)
+	t.Cleanup(func() { transientErrorCooldownSeconds.Store(previous); reg.UnregisterClient(clientID) })
+	if _, err := manager.Register(context.Background(), &Auth{ID: clientID, Provider: "deadline-fixture", Status: StatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	reg.RegisterClient(clientID, "deadline-fixture", []*registry.ModelInfo{{ID: model}})
+	manager.MarkResult(context.Background(), Result{AuthID: clientID, Provider: "deadline-fixture", Model: model, Error: &Error{HTTPStatus: http.StatusBadGateway, Message: "synthetic transient failure"}})
+	contains := func() bool {
+		for _, item := range reg.GetAvailableModels("openai") {
+			if item["id"] == model {
+				return true
+			}
+		}
+		return false
+	}
+	if contains() {
+		t.Fatal("active temporary restriction must hide model and build the hidden cache")
+	}
+	auth, ok := manager.GetByID(clientID)
+	if !ok || auth.ModelStates[model] == nil {
+		t.Fatal("actual MarkResult did not create model state")
+	}
+	deadline := auth.ModelStates[model].NextRetryAfter
+	if wait := time.Until(deadline); wait < 0 || wait > 2*time.Second {
+		t.Fatalf("unexpected bounded test deadline: %v", wait)
+	}
+	time.Sleep(time.Until(deadline) + 10*time.Millisecond)
+	// No new MarkResult, registration, configuration, probe or model execution.
+	if !contains() {
+		t.Fatal("public cached model directory must recover from its own expiry")
+	}
+	if reg.IsModelSuspendedForClient(clientID, model) || reg.GetModelCount(model) != 1 {
+		t.Fatal("registry read surfaces disagree after expiry")
+	}
+	if blocked, _, _ := isAuthBlockedForModel(auth, model, time.Now()); blocked {
+		t.Fatal("scheduler must agree with catalog after expiry")
+	}
+}
+
+func TestClientModelProjectionTemporaryAndPermanentRestrictions(t *testing.T) {
+	now := time.Now()
+	future, past := now.Add(time.Minute), now.Add(-time.Minute)
+	manager := NewManager(nil, nil, nil)
+	for _, tc := range []struct {
+		name          string
+		state         ModelState
+		disabled      bool
+		wantSuspended bool
+		wantDeadline  bool
+	}{
+		{"future_transient", ModelState{Unavailable: true, NextRetryAfter: future}, false, true, true},
+		{"expired_transient", ModelState{Unavailable: true, NextRetryAfter: past}, false, false, false},
+		{"untimed_unavailable", ModelState{Unavailable: true}, false, true, false},
+		{"disabled_auth", ModelState{Unavailable: true, NextRetryAfter: future}, true, true, false},
+		{"disabled_model", ModelState{Status: StatusDisabled, Unavailable: true, NextRetryAfter: past}, false, true, false},
+		{"active_quota", ModelState{Unavailable: true, NextRetryAfter: future, Quota: QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: future}}, false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &Auth{ID: "deadline-projection-fixture", Status: StatusActive, Disabled: tc.disabled, ModelStates: map[string]*ModelState{"deadline-model": &tc.state}}
+			p := manager.clientModelProjectionForAuth(auth, "deadline-model", now)
+			if p.Suspended != tc.wantSuspended || !p.SuspendUntil.IsZero() != tc.wantDeadline {
+				t.Fatalf("unexpected projection: %+v", p)
+			}
+			if tc.wantDeadline && !p.SuspendUntil.Equal(future) {
+				t.Fatal("deadline must be the auth authority's actual deadline")
+			}
+		})
+	}
+}

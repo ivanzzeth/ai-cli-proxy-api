@@ -1,6 +1,9 @@
 package registry
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestGetAvailableModelsReturnsClonedSnapshots(t *testing.T) {
 	r := newTestModelRegistry()
@@ -96,5 +99,111 @@ func TestGetAvailableModelsInvalidatesCacheOnRegistryChanges(t *testing.T) {
 	models = r.GetAvailableModels("openai")
 	if len(models) != 1 {
 		t.Fatalf("expected model to reappear after resume, got %d", len(models))
+	}
+}
+
+func TestTemporarySuspensionExpiresAcrossRegistryReadSurfaces(t *testing.T) {
+	r := newTestModelRegistry()
+	const id, model, provider = "deadline-client", "deadline-model", "deadline-provider"
+	r.RegisterClient(id, provider, []*ModelInfo{{ID: model}})
+	_, epoch := r.GetModelsAndEpochForClient(id)
+	until := time.Now().Add(500 * time.Millisecond)
+	if !r.ApplyClientModelProjections(id, epoch, 1, []ClientModelProjection{{ModelID: model, Suspended: true, SuspendReason: "transient_error", SuspendUntil: until}}) {
+		t.Fatal("projection rejected")
+	}
+	if len(r.GetAvailableModels("openai")) != 0 {
+		t.Fatal("active cooldown must hide model")
+	}
+	if !r.availableModelsCache["openai"].expiresAt.Equal(until) {
+		t.Fatal("hidden cache must carry exact auth deadline")
+	}
+	time.Sleep(time.Until(until) + 10*time.Millisecond)
+	// The only trigger is a read; no config change, new registration or result.
+	if len(r.GetAvailableModels("openai")) != 1 || len(r.GetAvailableModelInfos()) != 1 || len(r.GetAvailableModelsByProvider(provider)) != 1 || r.GetModelCount(model) != 1 || r.IsModelSuspendedForClient(id, model) {
+		t.Fatal("read surfaces did not recover consistently")
+	}
+}
+
+func TestSuspensionDeadlineChangesInvalidateSameReasonCache(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("c", "p", []*ModelInfo{{ID: "m"}})
+	_, epoch := r.GetModelsAndEpochForClient("c")
+	first, extended := time.Now().Add(time.Minute), time.Now().Add(2*time.Minute)
+	project := func(generation uint64, until time.Time) bool {
+		return r.ApplyClientModelProjections("c", epoch, generation, []ClientModelProjection{{ModelID: "m", Suspended: true, SuspendReason: "transient_error", SuspendUntil: until}})
+	}
+	if !project(1, first) {
+		t.Fatal("initial projection rejected")
+	}
+	r.GetAvailableModels("openai")
+	if !project(2, extended) {
+		t.Fatal("extended projection rejected")
+	}
+	r.GetAvailableModels("openai")
+	if !r.availableModelsCache["openai"].expiresAt.Equal(extended) {
+		t.Fatal("same reason deadline extension retained stale cache")
+	}
+	if project(1, time.Time{}) {
+		t.Fatal("stale generation accepted")
+	}
+	if !r.models["m"].SuspensionDeadlines["c"].Equal(extended) {
+		t.Fatal("stale write changed deadline")
+	}
+	if !project(3, first) {
+		t.Fatal("shortened projection rejected")
+	}
+	r.GetAvailableModels("openai")
+	if !r.availableModelsCache["openai"].expiresAt.Equal(first) {
+		t.Fatal("same reason deadline shortening retained stale cache")
+	}
+}
+
+func TestSuspensionDeadlineLifecycleAndExistingPolicies(t *testing.T) {
+	for _, action := range []string{"resume", "reregister", "unregister", "legacy_permanent"} {
+		t.Run(action, func(t *testing.T) {
+			r := newTestModelRegistry()
+			r.RegisterClient("c", "p", []*ModelInfo{{ID: "m"}})
+			_, epoch := r.GetModelsAndEpochForClient("c")
+			if !r.ApplyClientModelProjections("c", epoch, 1, []ClientModelProjection{{ModelID: "m", Suspended: true, SuspendReason: "transient_error", SuspendUntil: time.Now().Add(time.Minute)}}) {
+				t.Fatal("projection rejected")
+			}
+			switch action {
+			case "resume":
+				r.ResumeClientModel("c", "m")
+			case "reregister":
+				r.RegisterClient("c", "p", []*ModelInfo{{ID: "m"}})
+			case "unregister":
+				r.UnregisterClient("c")
+				r.RegisterClient("c", "p", []*ModelInfo{{ID: "m"}})
+			case "legacy_permanent":
+				r.SuspendClientModel("c", "m", "disabled")
+			}
+			if _, remains := r.models["m"].SuspensionDeadlines["c"]; remains {
+				t.Fatal("deadline leaked through lifecycle")
+			}
+			_, suspended, _ := activeModelSuspension(r.models["m"], "c", time.Now().Add(2*time.Minute))
+			if suspended != (action == "legacy_permanent") {
+				t.Fatal("permanent restriction or cleanup changed")
+			}
+			if action == "reregister" || action == "unregister" {
+				if r.ApplyClientModelProjections("c", epoch, 99, []ClientModelProjection{{ModelID: "m", Suspended: true, SuspendUntil: time.Now().Add(time.Minute)}}) {
+					t.Fatal("old epoch resurrected a deadline")
+				}
+			}
+		})
+	}
+	// Preserve native quota policy: catalog visibility is not scheduling permission.
+	r := newTestModelRegistry()
+	r.RegisterClient("quota", "p", []*ModelInfo{{ID: "m"}})
+	_, epoch := r.GetModelsAndEpochForClient("quota")
+	r.ApplyClientModelProjections("quota", epoch, 1, []ClientModelProjection{{ModelID: "m", Suspended: true, SuspendReason: "quota", SuspendUntil: time.Now().Add(-time.Minute), QuotaExceeded: true}})
+	if len(r.GetAvailableModels("openai")) != 1 || r.GetModelCount("m") != 0 {
+		t.Fatal("existing quota catalog/count semantics changed")
+	}
+	// At least one ready credential keeps a model visible.
+	r.RegisterClient("ready", "p", []*ModelInfo{{ID: "m"}})
+	r.SuspendClientModel("quota", "m", "disabled")
+	if len(r.GetAvailableModels("openai")) != 1 || r.GetModelCount("m") != 1 {
+		t.Fatal("ready sibling must keep model visible")
 	}
 }

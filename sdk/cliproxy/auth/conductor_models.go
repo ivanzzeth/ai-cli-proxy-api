@@ -235,15 +235,25 @@ func (m *Manager) clientModelProjectionForAuth(auth *Auth, routeModel string, no
 	}
 
 	state := existingModelState(auth, targetKey)
-	isSuspended := auth.Disabled || auth.Status == StatusDisabled
-	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+	permanentSuspension := auth.Disabled || auth.Status == StatusDisabled
+	isSuspended := permanentSuspension
+	var suspendUntil time.Time
+	credentialQuotaActive := auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now)
+	if credentialQuotaActive {
 		isSuspended = true
 	}
 	isQuotaExceeded := false
 	var suspendReason string
 	if state != nil {
-		if state.Status == StatusDisabled || state.Unavailable || (!state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now)) {
+		blocked, _, retryAt := availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now)
+		if state.Status == StatusDisabled {
+			permanentSuspension = true
 			isSuspended = true
+		} else if blocked {
+			isSuspended = true
+			if !permanentSuspension && !credentialQuotaActive {
+				suspendUntil = retryAt
+			}
 		}
 		if state.Quota.Exceeded && (state.Quota.NextRecoverAt.IsZero() || state.Quota.NextRecoverAt.After(now)) {
 			isQuotaExceeded = true
@@ -258,13 +268,22 @@ func (m *Manager) clientModelProjectionForAuth(auth *Auth, routeModel string, no
 		// When states exist, unmatched models stay schedulable by design, so the
 		// credential-wide fields must not suspend them here either.
 		isSuspended = true
+		if !permanentSuspension && !credentialQuotaActive {
+			suspendUntil = auth.NextRetryAfter
+		}
 	}
 	if isSuspended && suspendReason == "" {
 		suspendReason = cooldownReason(auth.StatusMessage, auth.Quota, auth.LastError)
 	}
 
+	// Quota visibility retains its existing registry policy. Disabled and
+	// untimed restrictions must never acquire a recoverable deadline.
+	if permanentSuspension || credentialQuotaActive || strings.EqualFold(suspendReason, "quota") {
+		suspendUntil = time.Time{}
+	}
 	return registry.ClientModelProjection{
 		ModelID:       targetModel,
+		SuspendUntil:  suspendUntil,
 		Suspended:     isSuspended,
 		SuspendReason: suspendReason,
 		QuotaExceeded: isQuotaExceeded,
