@@ -39,3 +39,17 @@ func TestResolveConfigClaudeKeyUsesConfigIndex(t *testing.T) {
 		t.Fatalf("resolved config entry = %+v, want second entry", entry)
 	}
 }
+
+func TestPlanSpeechRegistrationHasOnlyExplicitAudioCapability(t *testing.T) {
+	models := buildOpenAICompatibilityConfigModels(&config.OpenAICompatibility{Name: "plan", Models: []config.OpenAICompatibilityModel{{Name: "text-model"}, {Name: "doubao-seedream-5.0-flash", Image: true, ImageProfile: "ark-agent-plan-seedream-5flash-v1"}, {Name: "doubao-seed-tts-2.0", SpeechProfile: "ark-agent-plan-tts-2-v1", UpstreamProtocol: "volcengine-tts-v3-http"}}})
+	if len(models) != 3 {
+		t.Fatalf("models=%d", len(models))
+	}
+	if models[0].AudioSpeech != nil || models[1].AudioSpeech != nil {
+		t.Fatal("profile invented on existing models")
+	}
+	m := models[2]
+	if m.AudioSpeech == nil || m.Thinking != nil || len(m.SupportedOutputModalities) != 1 || m.SupportedOutputModalities[0] != "audio" || m.AudioSpeech.SupportedEndpoints[0] != "/v1/audio/speech" {
+		t.Fatalf("speech registration=%#v", m)
+	}
+}

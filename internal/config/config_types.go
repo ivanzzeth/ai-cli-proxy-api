@@ -873,6 +873,10 @@ type OpenAICompatibilityModel struct {
 	Image bool `yaml:"image,omitempty" json:"image,omitempty"`
 	// ImageProfile opts this configured model into a versioned native image contract.
 	ImageProfile string `yaml:"image-profile,omitempty" json:"image_profile,omitempty"`
+	// SpeechProfile explicitly opts a Plan model into fixed HTTP speech execution.
+	SpeechProfile string `yaml:"speech-profile,omitempty" json:"speech_profile,omitempty"`
+	// UpstreamProtocol names the wire adapter, independently of public API format.
+	UpstreamProtocol registry.UpstreamProtocol `yaml:"upstream-protocol,omitempty" json:"upstream_protocol,omitempty"`
 
 	// InputModalities declares chat/responses input capabilities (e.g. text, image) for Codex and other clients.
 	// This is separate from Image, which only enables /v1/images/* endpoints.

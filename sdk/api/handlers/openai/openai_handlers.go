@@ -102,6 +102,12 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 			filteredModel["image_generation"] = support
 		}
 
+		if protocol, exists := model["upstream_protocol"]; exists && protocol != "" {
+			filteredModel["upstream_protocol"] = protocol
+		}
+		if support, exists := model["audio_speech"]; exists && support != nil {
+			filteredModel["audio_speech"] = support
+		}
 		filteredModels[i] = filteredModel
 	}
 

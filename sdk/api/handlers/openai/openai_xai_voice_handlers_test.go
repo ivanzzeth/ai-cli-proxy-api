@@ -2,11 +2,18 @@ package openai_test
 
 import (
 	"context"
+	planconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
+	native "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	configaccess "github.com/router-for-me/CLIProxyAPI/v8/internal/access/config_access"
@@ -123,5 +130,66 @@ func TestXAIVoiceNativeErrorBodyHeadersWithoutGenericPassthrough(t *testing.T) {
 	router.ServeHTTP(rec, request)
 	if rec.Code != 429 || rec.Body.String() != `{"error":{"message":"native limited"}}` || rec.Header().Get("Retry-After") != "7" || rec.Header().Get("X-Request-Id") != "voice-native-error" || rec.Header().Get("Set-Cookie") != "" || wires.Load() != 1 {
 		t.Fatalf("native raw error mismatch status=%d wires=%d retry=%q", rec.Code, wires.Load(), rec.Header().Get("Retry-After"))
+	}
+}
+
+func TestPlanSpeechHandlerRealCompatExecutorPreservesInternalCount(t *testing.T) {
+	var wires atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wires.Add(1)
+		_, _ = io.WriteString(w, `{"code":0,"data":"SUQzBAAAAAAAAA==","usage":{"text_words":2}}`+"\n"+`{"code":20000000,"usage":{"text_words":2}}`)
+	}))
+	defer srv.Close()
+	transport := srv.Client().Transport.(*http.Transport).Clone()
+	transport.TLSClientConfig.ServerName = srv.Certificate().DNSNames[0]
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+	cfg := &planconfig.Config{OpenAICompatibility: []planconfig.OpenAICompatibility{{
+		Name: "plan", Prefix: "source-A", BaseURL: "https://ark.cn-beijing.volces.com/api/plan/v3",
+		APIKeyEntries: []planconfig.OpenAICompatibilityAPIKey{{APIKey: "fixture-plan-key"}},
+		Models:        []planconfig.OpenAICompatibilityModel{{Name: "doubao-seed-tts-2.0", SpeechProfile: "ark-agent-plan-tts-2-v1", UpstreamProtocol: "volcengine-tts-v3-http"}},
+	}}}
+	manager := auth.NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	entries, err := synthesizer.NewConfigSynthesizer().Synthesize(&synthesizer.SynthesisContext{Config: cfg, Now: time.Now(), IDGenerator: synthesizer.NewStableIDGenerator()})
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("normal config synthesis failed: count=%d err=%v", len(entries), err)
+	}
+	credential := entries[0]
+	manager.RegisterExecutor(runtimeexecutor.NewOpenAICompatExecutor(credential.Provider, cfg))
+	if _, err := manager.Register(context.Background(), credential); err != nil {
+		t.Fatal(err)
+	}
+	// Match Service.applyModelPrefixes under this config's ForceModelPrefix=false.
+	registry.GetGlobalRegistry().RegisterClient(credential.ID, credential.Provider, []*registry.ModelInfo{
+		{ID: "doubao-seed-tts-2.0", UpstreamProtocol: "volcengine-tts-v3-http", AudioSpeech: registry.ArkPlanSpeechProfile("ark-agent-plan-tts-2-v1")},
+		{ID: "source-A/doubao-seed-tts-2.0", MetadataModelID: "doubao-seed-tts-2.0", UpstreamProtocol: "volcengine-tts-v3-http", AudioSpeech: registry.ArkPlanSpeechProfile("ark-agent-plan-tts-2-v1")},
+	})
+	defer registry.GetGlobalRegistry().UnregisterClient(credential.ID)
+	manager.RefreshSchedulerEntry(credential.ID)
+	selected, selectErr := manager.SelectAuth(context.Background(), credential.Provider, "source-A/doubao-seed-tts-2.0", native.Options{})
+	if selectErr != nil || selected == nil || selected.ID != credential.ID {
+		t.Fatalf("normal config route selection failed: selected=%v err=%v", selected != nil, selectErr)
+	}
+	h := openai.NewOpenAIAPIHandler(base.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	router := gin.New()
+	router.POST("/v1/audio/speech", h.AudioSpeech)
+	for _, spoof := range []bool{true, false} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/audio/speech", strings.NewReader(`{"model":"source-A/doubao-seed-tts-2.0","input":"你好"}`))
+		req = req.WithContext(context.WithValue(req.Context(), "cliproxy.roundtripper", transport))
+		if spoof {
+			req.Header.Set("X-CLIProxy-Speech-Text-Words", "0")
+		}
+		router.ServeHTTP(rec, req)
+		if spoof {
+			if rec.Code != 400 || wires.Load() != 0 {
+				t.Fatal("spoof reached supplier")
+			}
+		} else if rec.Code != 200 || rec.Header().Get("X-CLIProxy-Speech-Text-Words") != "2" || rec.Header().Get("Content-Type") != "audio/mpeg" || wires.Load() != 1 {
+			t.Fatalf("status=%d count=%s wires=%d body=%s", rec.Code, rec.Header().Get("X-CLIProxy-Speech-Text-Words"), wires.Load(), rec.Body.String())
+		}
 	}
 }

@@ -374,6 +374,12 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 		if m.OwnedBy != "" {
 			entry["owned_by"] = m.OwnedBy
 		}
+		if m.UpstreamProtocol != "" {
+			entry["upstream_protocol"] = m.UpstreamProtocol
+		}
+		if m.AudioSpeech != nil {
+			entry["audio_speech"] = registry.ArkPlanSpeechProfile(m.AudioSpeech.Profile)
+		}
 		result = append(result, entry)
 	}
 

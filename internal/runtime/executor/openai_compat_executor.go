@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -85,7 +86,7 @@ func (e *OpenAICompatExecutor) HttpRequest(ctx context.Context, auth *cliproxyau
 	return httpClient.Do(httpReq)
 }
 
-func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+func (e *OpenAICompatExecutor) executeCompatible(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
 		return e.executeImages(ctx, auth, req, opts, endpointPath)
@@ -341,7 +342,7 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 	return resp, nil
 }
 
-func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+func (e *OpenAICompatExecutor) executeCompatibleStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
 		return e.executeImagesStream(ctx, auth, req, opts, endpointPath)
@@ -737,7 +738,7 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 
-func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *OpenAICompatExecutor) countCompatibleTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	from := opts.SourceFormat
@@ -1117,4 +1118,99 @@ func openAICompatRetryAfter(status int, headers http.Header, body []byte, now ti
 		return &delay
 	}
 	return nil
+}
+
+// configuredUpstreamProtocol uses the selected credential's model declaration.
+// Neither model-name heuristics nor the customer's body/header can choose it.
+func (e *OpenAICompatExecutor) configuredUpstreamProtocol(auth *cliproxyauth.Auth, model string) (registry.UpstreamProtocol, error) {
+	model = thinking.ParseSuffix(model).ModelName
+	cfg := e.resolveCompatConfig(auth)
+	protocol := registry.UpstreamProtocolLegacy
+	found := false
+	if cfg != nil {
+		for _, row := range cfg.Models {
+			if row.Name != model && row.Alias != model {
+				continue
+			}
+			if !row.UpstreamProtocol.Known() {
+				return "", statusErr{code: 400, msg: "unknown upstream_protocol"}
+			}
+			if found && protocol != row.UpstreamProtocol {
+				return "", statusErr{code: 400, msg: "ambiguous upstream_protocol"}
+			}
+			protocol = row.UpstreamProtocol
+			found = true
+			if row.SpeechProfile != "" && protocol != registry.UpstreamProtocolVolcengineTTSV3HTTP {
+				return "", statusErr{code: 400, msg: "speech_profile requires an explicit TTS upstream_protocol"}
+			}
+		}
+	}
+	return protocol, nil
+}
+
+func logVolcengineTextOperation(ctx context.Context, operation string) {
+	helps.LogWithRequestID(ctx).WithFields(log.Fields{"upstream_protocol": string(registry.UpstreamProtocolVolcengineArkTextV3), "upstream_operation": operation}).Debug("native protocol selected")
+}
+
+// Execute dispatches an explicit native wire contract before any OpenAI translator.
+func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	protocol, err := e.configuredUpstreamProtocol(auth, req.Model)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if opts.SourceFormat.String() == "openai-speech" {
+		if protocol != registry.UpstreamProtocolVolcengineTTSV3HTTP {
+			return cliproxyexecutor.Response{}, statusErr{code: 400, msg: "explicit Volcengine TTS upstream_protocol required"}
+		}
+		return (VolcengineTTSAdapter{owner: e}).Execute(ctx, auth, req, opts)
+	}
+	if protocol == registry.UpstreamProtocolVolcengineTTSV3HTTP {
+		return cliproxyexecutor.Response{}, statusErr{code: 400, msg: "audio-only protocol requires /v1/audio/speech"}
+	}
+	if protocol == registry.UpstreamProtocolVolcengineArkTextV3 {
+		return e.executeVolcengineArkText(ctx, auth, req, opts)
+	}
+	return e.executeCompatible(ctx, auth, req, opts)
+}
+
+func (e *OpenAICompatExecutor) executeVolcengineArkText(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if openAICompatImageEndpointPath(opts) != "" || (opts.Alt != "" && opts.Alt != "responses/compact") {
+		return cliproxyexecutor.Response{}, statusErr{code: 400, msg: "unsupported Ark text operation"}
+	}
+	operation := "chat/completions"
+	if opts.Alt == "responses/compact" {
+		operation = "responses/compact"
+	}
+	logVolcengineTextOperation(ctx, operation)
+	// Preserve the existing compact passthrough. This is not a vendor capability claim.
+	return e.executeCompatible(ctx, auth, req, opts)
+}
+
+func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	protocol, err := e.configuredUpstreamProtocol(auth, req.Model)
+	if err != nil {
+		return nil, err
+	}
+	if protocol == registry.UpstreamProtocolVolcengineTTSV3HTTP || opts.SourceFormat.String() == "openai-speech" {
+		return nil, statusErr{code: 400, msg: "synchronous speech only"}
+	}
+	if protocol == registry.UpstreamProtocolVolcengineArkTextV3 {
+		if openAICompatImageEndpointPath(opts) != "" || (opts.Alt != "" && opts.Alt != "responses/compact") {
+			return nil, statusErr{code: 400, msg: "unsupported Ark text operation"}
+		}
+		// The existing streaming implementation uses chat/completions, even for Alt.
+		logVolcengineTextOperation(ctx, "chat/completions")
+	}
+	return e.executeCompatibleStream(ctx, auth, req, opts)
+}
+
+func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	protocol, err := e.configuredUpstreamProtocol(auth, req.Model)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if protocol == registry.UpstreamProtocolVolcengineTTSV3HTTP {
+		return cliproxyexecutor.Response{}, statusErr{code: 400, msg: "audio billing does not use token counts"}
+	}
+	return e.countCompatibleTokens(ctx, auth, req, opts)
 }

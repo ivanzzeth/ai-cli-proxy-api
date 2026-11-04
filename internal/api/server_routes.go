@@ -72,6 +72,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/videos/edits", openaiHandlers.XAIVideosEdits)
 		v1.POST("/videos/extensions", openaiHandlers.XAIVideosExtensions)
 		v1.GET("/videos/:request_id", openaiHandlers.XAIVideosRetrieve)
+		v1.POST("/audio/speech", openaiHandlers.AudioSpeech)
 		v1.POST("/tts", openaiHandlers.XAIVoiceHTTP)
 		v1.POST("/stt", openaiHandlers.XAIVoiceHTTP)
 		v1.POST("/custom-voices", openaiHandlers.XAIVoiceHTTP)

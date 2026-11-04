@@ -207,3 +207,20 @@ func TestSuspensionDeadlineLifecycleAndExistingPolicies(t *testing.T) {
 		t.Fatal("ready sibling must keep model visible")
 	}
 }
+
+func TestPlanSpeechCapabilityCacheSnapshotIsIndependent(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("speech-A", "openai", []*ModelInfo{{ID: "source-A/doubao-seed-tts-2.0", UpstreamProtocol: "volcengine-tts-v3-http", AudioSpeech: ArkPlanSpeechProfile("ark-agent-plan-tts-2-v1")}})
+	first := r.GetAvailableModels("openai")
+	if len(first) != 1 {
+		t.Fatal("missing speech model")
+	}
+	first[0]["audio_speech"].(*AudioSpeechSupport).Voices[0] = "mutated"
+	second := r.GetAvailableModels("openai")
+	if second[0]["audio_speech"].(*AudioSpeechSupport).Voices[0] != "zh_female_vv_uranus_bigtts" {
+		t.Fatal("cached speech metadata leaked mutations")
+	}
+	if ArkPlanSpeechProfile("unknown") != nil {
+		t.Fatal("unknown profile acquired capability")
+	}
+}

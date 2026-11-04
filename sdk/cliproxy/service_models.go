@@ -783,8 +783,12 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 		if info == nil {
 			continue
 		}
+		info.UpstreamProtocol = model.UpstreamProtocol
+		if model.UpstreamProtocol == registry.UpstreamProtocolVolcengineTTSV3HTTP {
+			info.AudioSpeech = registry.ArkPlanSpeechProfile(model.SpeechProfile)
+		}
 		thinkingSupport := model.Thinking
-		if thinkingSupport == nil && !model.Image {
+		if thinkingSupport == nil && !model.Image && info.AudioSpeech == nil {
 			thinkingSupport = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 		}
 		if model.Thinking != nil {
@@ -799,6 +803,12 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 		info.Thinking = modelconfig.NormalizeThinkingSupport(thinkingSupport)
 		info.SupportedInputModalities = normalizeCompatConfigModalities(model.InputModalities)
 		info.SupportedOutputModalities = normalizeCompatConfigModalities(model.OutputModalities)
+		if info.AudioSpeech != nil {
+			info.Type = "openai-audio-speech"
+			info.Thinking = nil
+			info.SupportedInputModalities = []string{"text"}
+			info.SupportedOutputModalities = []string{"audio"}
+		}
 		models = append(models, info)
 	}
 	return models

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -93,6 +94,48 @@ func TestVoiceConductorSingleAttemptMarksResultWithoutAnyReplay(t *testing.T) {
 				t.Fatal("native RetryAfter result classification lost")
 			}
 			t.Logf("manager_actual_wire_count status=%d wires=%d refresh=%d SourceB=%d", status, wires.Load(), executor.refreshes.Load(), b.Load())
+		})
+	}
+}
+
+type planSpeechConductorExecutor struct{ voiceConductorExecutor }
+
+func (*planSpeechConductorExecutor) Identifier() string { return "plan-speech-fixture" }
+func TestPlanSpeechManagerAttemptNeverRefreshesOrChangesCredential(t *testing.T) {
+	for _, status := range []int{401, 429, 0} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var wires, b atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				wires.Add(1)
+				if r.Header.Get("X-Test-Auth") == "B" {
+					b.Add(1)
+				}
+				if status == 0 {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err == nil {
+						_ = conn.Close()
+					}
+					return
+				}
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			executor := &planSpeechConductorExecutor{voiceConductorExecutor: voiceConductorExecutor{target: server.URL}}
+			manager := NewManager(nil, nil, nil)
+			manager.RegisterExecutor(executor)
+			manager.SetRetryConfig(3, time.Second, 3)
+			for _, id := range []string{"A", "B"} {
+				_, err := manager.Register(context.Background(), &Auth{ID: id, Provider: executor.Identifier(), Status: StatusActive, Attributes: map[string]string{"api_key": "fixture"}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				registry.GetGlobalRegistry().RegisterClient(id, executor.Identifier(), []*registry.ModelInfo{{ID: "speech-wire"}})
+				defer registry.GetGlobalRegistry().UnregisterClient(id)
+			}
+			_, err := manager.Execute(context.Background(), []string{executor.Identifier()}, native.Request{Model: "speech-wire", Payload: []byte(`{}`)}, native.Options{SourceFormat: sdktranslator.FromString("openai-speech"), NativeVoiceOperation: native.NativeVoiceTTS, SingleAttempt: true, Metadata: map[string]any{native.PinnedAuthMetadataKey: "A"}})
+			if err == nil || wires.Load() != 1 || b.Load() != 0 || executor.refreshes.Load() != 0 {
+				t.Fatalf("err=%v wires=%d B=%d refresh=%d", err, wires.Load(), b.Load(), executor.refreshes.Load())
+			}
 		})
 	}
 }

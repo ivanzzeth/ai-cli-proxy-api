@@ -52,9 +52,42 @@ func SeedreamImageProfile(profile string) *ImageGenerationSupport {
 	}
 }
 
+// UpstreamProtocol identifies a configured wire contract, never a caller-supplied URL.
+type UpstreamProtocol string
+
+const (
+	UpstreamProtocolLegacy              UpstreamProtocol = ""
+	UpstreamProtocolVolcengineArkTextV3 UpstreamProtocol = "volcengine-ark-text-v3"
+	UpstreamProtocolVolcengineTTSV3HTTP UpstreamProtocol = "volcengine-tts-v3-http"
+)
+
+func (p UpstreamProtocol) Known() bool {
+	return p == UpstreamProtocolLegacy || p == UpstreamProtocolVolcengineArkTextV3 || p == UpstreamProtocolVolcengineTTSV3HTTP
+}
+
+// AudioSpeechSupport describes an explicit native speech contract, not entitlement.
+type AudioSpeechSupport struct {
+	Profile            string   `json:"profile"`
+	SupportedEndpoints []string `json:"supported_endpoints"`
+	Formats            []string `json:"formats"`
+	SampleRates        []int    `json:"sample_rates"`
+	Voices             []string `json:"voices"`
+	MaxInputCodepoints int      `json:"max_input_codepoints"`
+	Stream             bool     `json:"stream"`
+}
+
+func ArkPlanSpeechProfile(profile string) *AudioSpeechSupport {
+	if profile != "ark-agent-plan-tts-2-v1" {
+		return nil
+	}
+	return &AudioSpeechSupport{Profile: profile, SupportedEndpoints: []string{"/v1/audio/speech"}, Formats: []string{"mp3"}, SampleRates: []int{24000}, Voices: []string{"zh_female_vv_uranus_bigtts"}, MaxInputCodepoints: 1000}
+}
+
 // ModelInfo represents information about an available model
 type ModelInfo struct {
-	ImageGeneration *ImageGenerationSupport `json:"image_generation,omitempty"`
+	UpstreamProtocol UpstreamProtocol        `json:"upstream_protocol,omitempty"`
+	AudioSpeech      *AudioSpeechSupport     `json:"audio_speech,omitempty"`
+	ImageGeneration  *ImageGenerationSupport `json:"image_generation,omitempty"`
 	// ID is the unique identifier for the model
 	ID string `json:"id"`
 	// MetadataModelID identifies the canonical model used to resolve client metadata.
@@ -785,6 +818,14 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 		return nil
 	}
 	copyModel := *model
+	if model.AudioSpeech != nil {
+		capability := *model.AudioSpeech
+		capability.SupportedEndpoints = append([]string(nil), capability.SupportedEndpoints...)
+		capability.Formats = append([]string(nil), capability.Formats...)
+		capability.SampleRates = append([]int(nil), capability.SampleRates...)
+		capability.Voices = append([]string(nil), capability.Voices...)
+		copyModel.AudioSpeech = &capability
+	}
 	if model.ImageGeneration != nil {
 		cap := *model.ImageGeneration
 		cap.SupportedEndpoints = append([]string(nil), cap.SupportedEndpoints...)
@@ -1470,6 +1511,8 @@ func cloneModelMaps(models []map[string]any) []map[string]any {
 
 func cloneModelMapValue(value any) any {
 	switch typed := value.(type) {
+	case *AudioSpeechSupport:
+		return cloneModelInfo(&ModelInfo{AudioSpeech: typed}).AudioSpeech
 	case map[string]any:
 		copyMap := make(map[string]any, len(typed))
 		for key, entry := range typed {
@@ -1753,6 +1796,12 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		}
 		if model.ImageGeneration != nil {
 			result["image_generation"] = cloneModelInfo(model).ImageGeneration
+		}
+		if model.UpstreamProtocol != "" {
+			result["upstream_protocol"] = model.UpstreamProtocol
+		}
+		if model.AudioSpeech != nil {
+			result["audio_speech"] = cloneModelInfo(model).AudioSpeech
 		}
 		if model.Created > 0 {
 			result["created"] = model.Created

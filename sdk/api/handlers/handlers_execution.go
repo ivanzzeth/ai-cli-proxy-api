@@ -128,10 +128,21 @@ func (h *BaseAPIHandler) executeResponseWithAuthManagerFormats(ctx context.Conte
 		status = http.StatusOK
 	}
 	rawResponseHeaders := cloneHeader(resp.Headers)
+	rawSpeechPayload := append([]byte(nil), resp.Payload...)
 	passthroughHeaders := executionPassthroughHeaders(h.Cfg, execOptions.InternalSource) || execOptions.NativeVoiceOperation != ""
 	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, passthroughHeaders)
 	body, responseHeaders := h.applyResponseInterceptors(ctx, lifecycle.requestID(), responseProtocol, normalizedModel, originalRequestedModel, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, status, execOptions.SkipInterceptorPluginID, passthroughHeaders)
-	if execOptions.NativeVoiceOperation != "" {
+	if entryProtocol == "openai-speech" {
+		if string(body) != string(rawSpeechPayload) || rawResponseHeaders.Get("X-CLIProxy-Speech-Text-Words") == "" {
+			return coreexecutor.Response{}, &interfaces.ErrorMessage{StatusCode: 502, Error: fmt.Errorf("speech_outcome_unknown: completed audio metadata changed")}
+		}
+		responseHeaders = make(http.Header)
+		responseHeaders.Set("Content-Type", "audio/mpeg")
+		responseHeaders.Set("X-CLIProxy-Speech-Text-Words", rawResponseHeaders.Get("X-CLIProxy-Speech-Text-Words"))
+		if id := rawResponseHeaders.Get("X-Request-Id"); id != "" {
+			responseHeaders.Set("X-Request-Id", id)
+		}
+	} else if execOptions.NativeVoiceOperation != "" {
 		safe := make(http.Header)
 		for _, name := range []string{"Content-Type", "Retry-After", "Location", "X-Request-Id"} {
 			if value := responseHeaders.Get(name); value != "" {

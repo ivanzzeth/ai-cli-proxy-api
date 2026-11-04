@@ -364,3 +364,45 @@ func TestOpenAIModelsPreservesPublicImageGenerationOnly(t *testing.T) {
 		})
 	}
 }
+
+func TestPlanSpeechPublicMetadataAndCodexTextExclusion(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	id := "speech-projection-native"
+	reg.RegisterClient(id, "openai", []*registry.ModelInfo{{ID: "speech-projection-model", UpstreamProtocol: "volcengine-tts-v3-http", AudioSpeech: registry.ArkPlanSpeechProfile("ark-agent-plan-tts-2-v1")}})
+	t.Cleanup(func() { reg.UnregisterClient(id) })
+	h := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(&config.SDKConfig{}, nil))
+	c, rec := func() (*gin.Context, *httptest.ResponseRecorder) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", "/v1/models", nil)
+		return c, w
+	}()
+	h.OpenAIModels(c)
+	var response struct {
+		Data []map[string]any `json:"data"`
+	}
+	if json.Unmarshal(rec.Body.Bytes(), &response) != nil {
+		t.Fatal("bad public models")
+	}
+	found := false
+	for _, m := range response.Data {
+		if m["id"] == "speech-projection-model" {
+			found = true
+			if m["audio_speech"] == nil {
+				t.Fatal("lost speech metadata")
+			}
+			for k := range m {
+				if k != "id" && k != "object" && k != "created" && k != "owned_by" && k != "audio_speech" && k != "upstream_protocol" {
+					t.Fatalf("unexpected field %s", k)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("missing public speech model")
+	}
+	models := withoutAudioOnlyModels([]map[string]any{{"id": "plain"}, {"id": "speech", "audio_speech": map[string]any{"profile": "ark-agent-plan-tts-2-v1"}}, {"id": "image", "image_generation": map[string]any{}}})
+	if len(models) != 2 || models[0]["id"] != "plain" || models[1]["id"] != "image" {
+		t.Fatal("Codex exclusion changed old models")
+	}
+}

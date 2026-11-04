@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -87,5 +88,34 @@ func TestVoiceExecutionCredentialNilManagerKeepsDiskFilesAndEmptyProjection(t *t
 	}
 	if rec.Code != 200 || len(data.Files) != 1 || data.Total != 1 || data.Credentials == nil || len(data.Credentials) != 0 {
 		t.Fatalf("legacy disk fallback fields lost: code%d files%d total%d empty_present%v", rec.Code, len(data.Files), data.Total, data.Credentials != nil)
+	}
+}
+
+func TestPlanSpeechCredentialModelsUsesRegistryMetadata(t *testing.T) {
+	manager := auth.NewManager(nil, nil, nil)
+	id := "speech-credential-test"
+	if _, err := manager.Register(context.Background(), &auth.Auth{ID: id, Provider: "plan", Status: auth.StatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(id, "plan", []*registry.ModelInfo{{ID: "source-a/doubao-seed-tts-2.0", UpstreamProtocol: "volcengine-tts-v3-http", AudioSpeech: registry.ArkPlanSpeechProfile("ark-agent-plan-tts-2-v1")}, {ID: "plain"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	h := &Handler{authManager: manager}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest("GET", "/v0/management/auth-files/models?name="+id, nil)
+	h.GetAuthFileModels(c)
+	var body struct {
+		Models []map[string]any `json:"models"`
+	}
+	if json.Unmarshal(rec.Body.Bytes(), &body) != nil || len(body.Models) != 2 {
+		t.Fatal("credential model projection failed")
+	}
+	for _, m := range body.Models {
+		if m["id"] == "plain" && m["audio_speech"] != nil {
+			t.Fatal("invented capability")
+		}
+		if m["id"] != "plain" && m["audio_speech"] == nil {
+			t.Fatal("lost native speech metadata")
+		}
 	}
 }
