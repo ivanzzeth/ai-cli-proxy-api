@@ -224,3 +224,33 @@ func TestPlanSpeechCapabilityCacheSnapshotIsIndependent(t *testing.T) {
 		t.Fatal("unknown profile acquired capability")
 	}
 }
+
+func TestXAISpeechRegistryProjectionIsCredentialScopedAndCloned(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("speech-A", "xai", []*ModelInfo{xaiBuiltinSpeechModelInfo()})
+	r.RegisterClient("text-B", "xai", []*ModelInfo{{ID: "other-model", OwnedBy: "xai"}})
+	scoped := r.GetModelsForClient("text-B")
+	if len(scoped) != 1 || scoped[0].AudioSpeech != nil {
+		t.Fatal("speech metadata leaked to a different credential")
+	}
+	first := r.GetAvailableModels("openai")
+	var speech *AudioSpeechSupport
+	for _, item := range first {
+		if item["id"] == "grok-tts" {
+			speech, _ = item["audio_speech"].(*AudioSpeechSupport)
+		}
+	}
+	if speech == nil {
+		t.Fatal("public speech metadata missing")
+	}
+	speech.Formats[0] = "mutated"
+	speech.UsageSource = "forged"
+	for _, item := range r.GetAvailableModels("openai") {
+		if item["id"] == "grok-tts" {
+			copy := item["audio_speech"].(*AudioSpeechSupport)
+			if copy.Formats[0] != "mp3" || copy.UsageSource != "request_estimated_characters" {
+				t.Fatal("cached model metadata shared mutable state")
+			}
+		}
+	}
+}

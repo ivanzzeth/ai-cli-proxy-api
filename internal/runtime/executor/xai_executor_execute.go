@@ -20,6 +20,9 @@ import (
 
 func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
+	if declared := xaiDeclaredSpeechModel(auth, req.Model); declared != nil && (opts.NativeVoiceOperation != cliproxyexecutor.NativeVoiceTTS || opts.Stream) {
+		return resp, statusErr{code: 400, msg: "declared audio-only model requires its supported TTS operation"}
+	}
 	if opts.NativeVoiceOperation != "" {
 		return e.executeVoiceHTTP(ctx, auth, req, opts)
 	}

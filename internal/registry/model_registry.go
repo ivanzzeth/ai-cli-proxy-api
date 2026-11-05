@@ -57,16 +57,20 @@ type UpstreamProtocol string
 
 const (
 	UpstreamProtocolLegacy              UpstreamProtocol = ""
+	UpstreamProtocolXAIVoiceHTTP        UpstreamProtocol = "xai-voice-http"
 	UpstreamProtocolVolcengineArkTextV3 UpstreamProtocol = "volcengine-ark-text-v3"
 	UpstreamProtocolVolcengineTTSV3HTTP UpstreamProtocol = "volcengine-tts-v3-http"
 )
 
 func (p UpstreamProtocol) Known() bool {
-	return p == UpstreamProtocolLegacy || p == UpstreamProtocolVolcengineArkTextV3 || p == UpstreamProtocolVolcengineTTSV3HTTP
+	return p == UpstreamProtocolXAIVoiceHTTP || p == UpstreamProtocolLegacy || p == UpstreamProtocolVolcengineArkTextV3 || p == UpstreamProtocolVolcengineTTSV3HTTP
 }
 
 // AudioSpeechSupport describes an explicit native speech contract, not entitlement.
 type AudioSpeechSupport struct {
+	UsageSource        string   `json:"usage_source,omitempty"`
+	MinSpeed           float64  `json:"min_speed,omitempty"`
+	MaxSpeed           float64  `json:"max_speed,omitempty"`
 	Profile            string   `json:"profile"`
 	SupportedEndpoints []string `json:"supported_endpoints"`
 	Formats            []string `json:"formats"`
@@ -80,7 +84,7 @@ func ArkPlanSpeechProfile(profile string) *AudioSpeechSupport {
 	if profile != "ark-agent-plan-tts-2-v1" {
 		return nil
 	}
-	return &AudioSpeechSupport{Profile: profile, SupportedEndpoints: []string{"/v1/audio/speech"}, Formats: []string{"mp3"}, SampleRates: []int{24000}, Voices: []string{"zh_female_vv_uranus_bigtts"}, MaxInputCodepoints: 1000}
+	return &AudioSpeechSupport{UsageSource: "upstream_actual_words", MinSpeed: 1, MaxSpeed: 1, Profile: profile, SupportedEndpoints: []string{"/v1/audio/speech"}, Formats: []string{"mp3"}, SampleRates: []int{24000}, Voices: []string{"zh_female_vv_uranus_bigtts"}, MaxInputCodepoints: 1000}
 }
 
 // ModelInfo represents information about an available model
@@ -2034,4 +2038,9 @@ func (r *ModelRegistry) ClientRegistrationEpoch(clientID string) uint64 {
 func (r *ModelRegistry) GetModelsForClient(clientID string) []*ModelInfo {
 	models, _ := r.GetModelsAndEpochForClient(clientID)
 	return models
+}
+
+// XAISpeechProfile describes a real native model/operation, not an entitlement.
+func XAISpeechProfile() *AudioSpeechSupport {
+	return &AudioSpeechSupport{Profile: "xai-grok-tts-v1", SupportedEndpoints: []string{"/v1/audio/speech", "/v1/tts"}, Formats: []string{"mp3", "wav", "pcm"}, SampleRates: []int{24000}, MaxInputCodepoints: 4096, UsageSource: "request_estimated_characters", MinSpeed: 0.7, MaxSpeed: 1.5}
 }

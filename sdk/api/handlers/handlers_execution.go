@@ -1,9 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tidwall/gjson"
+	"mime"
 	"net/http"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
@@ -133,12 +136,33 @@ func (h *BaseAPIHandler) executeResponseWithAuthManagerFormats(ctx context.Conte
 	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, passthroughHeaders)
 	body, responseHeaders := h.applyResponseInterceptors(ctx, lifecycle.requestID(), responseProtocol, normalizedModel, originalRequestedModel, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, status, execOptions.SkipInterceptorPluginID, passthroughHeaders)
 	if entryProtocol == "openai-speech" {
-		if string(body) != string(rawSpeechPayload) || rawResponseHeaders.Get("X-CLIProxy-Speech-Text-Words") == "" {
-			return coreexecutor.Response{}, &interfaces.ErrorMessage{StatusCode: 502, Error: fmt.Errorf("speech_outcome_unknown: completed audio metadata changed")}
+		if !bytes.Equal(body, rawSpeechPayload) {
+			return coreexecutor.Response{}, &interfaces.ErrorMessage{StatusCode: 502, Error: fmt.Errorf("speech_outcome_unknown: audio changed")}
 		}
 		responseHeaders = make(http.Header)
-		responseHeaders.Set("Content-Type", "audio/mpeg")
-		responseHeaders.Set("X-CLIProxy-Speech-Text-Words", rawResponseHeaders.Get("X-CLIProxy-Speech-Text-Words"))
+		protocol, _ := resp.Metadata["upstream_protocol"].(string)
+		source, _ := resp.Metadata["speech_usage_source"].(string)
+		switch protocol {
+		case "volcengine-tts-v3-http":
+			if source != "upstream_actual_words" || rawResponseHeaders.Get("X-CLIProxy-Speech-Text-Words") == "" || rawResponseHeaders.Get("Content-Type") != "audio/mpeg" {
+				return coreexecutor.Response{}, &interfaces.ErrorMessage{StatusCode: 502, Error: fmt.Errorf("speech_outcome_unknown: actual usage missing")}
+			}
+			responseHeaders.Set("Content-Type", "audio/mpeg")
+			responseHeaders.Set("X-CLIProxy-Speech-Text-Words", rawResponseHeaders.Get("X-CLIProxy-Speech-Text-Words"))
+		case "xai-voice-http":
+			content, _, mimeErr := mime.ParseMediaType(rawResponseHeaders.Get("Content-Type"))
+			requestedCodec := gjson.GetBytes(executedReq.Payload, "response_format").String()
+			if requestedCodec == "" {
+				requestedCodec = "mp3"
+			}
+			expected := map[string]string{"mp3": "audio/mpeg", "wav": "audio/wav", "pcm": "audio/pcm"}[requestedCodec]
+			if mimeErr != nil || expected == "" || content != expected || source != "request_estimated_characters" || rawResponseHeaders.Get("X-CLIProxy-Speech-Text-Words") != "" || (content != "audio/mpeg" && content != "audio/wav" && content != "audio/pcm") {
+				return coreexecutor.Response{}, &interfaces.ErrorMessage{StatusCode: 502, Error: fmt.Errorf("speech_outcome_unknown: xAI audio metadata invalid")}
+			}
+			responseHeaders.Set("Content-Type", content)
+		default:
+			return coreexecutor.Response{}, &interfaces.ErrorMessage{StatusCode: 502, Error: fmt.Errorf("speech_outcome_unknown: unverified protocol")}
+		}
 		if id := rawResponseHeaders.Get("X-Request-Id"); id != "" {
 			responseHeaders.Set("X-Request-Id", id)
 		}

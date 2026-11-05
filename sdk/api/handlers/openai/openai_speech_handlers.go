@@ -62,5 +62,5 @@ func (h *OpenAIAPIHandler) AudioSpeech(c *gin.Context) {
 		c.Writer.Header()[name] = append([]string(nil), values...)
 	}
 	c.Header("Content-Length", strconv.Itoa(len(response.Body)))
-	c.Data(http.StatusOK, "audio/mpeg", response.Body)
+	c.Data(http.StatusOK, response.Headers.Get("Content-Type"), response.Body)
 }

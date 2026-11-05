@@ -134,5 +134,5 @@ func (adapter VolcengineTTSAdapter) Execute(ctx context.Context, auth *cliproxya
 	header.Set("X-CLIProxy-Speech-Text-Words", strconv.FormatInt(words, 10))
 	header.Set("X-Request-Id", request.Header.Get("X-Api-Request-Id"))
 	reporter.EnsurePublished(ctx)
-	return native.Response{StatusCode: 200, Payload: audio, Headers: header}, nil
+	return native.Response{StatusCode: 200, Payload: audio, Headers: header, Metadata: map[string]any{"upstream_protocol": string(registry.UpstreamProtocolVolcengineTTSV3HTTP), "speech_usage_source": "upstream_actual_words"}}, nil
 }
