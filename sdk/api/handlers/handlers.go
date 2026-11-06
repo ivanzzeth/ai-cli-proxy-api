@@ -217,6 +217,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 
 	meta := make(map[string]any)
+	if serverBridgeSingleAttempt(ctx) && protectedServerCredentialPin(ctx) != "" {
+		meta["server_bridge_single_attempt"] = true
+	}
 	if key != "" {
 		meta[idempotencyKeyMetadataKey] = key
 	}

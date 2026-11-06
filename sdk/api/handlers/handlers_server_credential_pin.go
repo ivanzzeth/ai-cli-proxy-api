@@ -13,6 +13,21 @@ import (
 
 type serverCredentialPinScopeKey struct{}
 type serverCredentialPinErrorKey struct{}
+type serverBridgeSingleAttemptKey struct{}
+
+func serverBridgeSingleAttempt(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	if enabled, _ := ctx.Value(serverBridgeSingleAttemptKey{}).(bool); enabled {
+		return true
+	}
+	if c, ok := ctx.Value("gin").(*gin.Context); ok && c != nil && c.Request != nil {
+		enabled, _ := c.Request.Context().Value(serverBridgeSingleAttemptKey{}).(bool)
+		return enabled
+	}
+	return false
+}
 
 func serverCredentialPinError(status int, message string) *interfaces.ErrorMessage {
 	return &interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", message)}
@@ -73,6 +88,17 @@ func (h *BaseAPIHandler) PrepareServerCredentialPin(c *gin.Context) (string, boo
 			return "", true, serverCredentialPinError(http.StatusBadRequest, "server credential pin scope conflicts")
 		}
 	}
+	policyPresent := false
+	var policyValues []string
+	for name, values := range c.Request.Header {
+		if strings.EqualFold(name, "X-CLIProxy-Single-Attempt") {
+			policyPresent = true
+			policyValues = append(policyValues, values...)
+		}
+	}
+	if policyPresent && (id == "" || len(policyValues) != 1 || policyValues[0] != "1") {
+		return "", true, serverCredentialPinError(http.StatusBadRequest, "single-attempt policy requires one protected server credential pin")
+	}
 	if id == "" {
 		return "", false, nil
 	}
@@ -83,8 +109,11 @@ func (h *BaseAPIHandler) PrepareServerCredentialPin(c *gin.Context) (string, boo
 		return "", true, failure
 	}
 	request := c.Request.Clone(context.WithValue(c.Request.Context(), serverCredentialPinScopeKey{}, id))
+	if policyPresent {
+		request = request.Clone(context.WithValue(request.Context(), serverBridgeSingleAttemptKey{}, true))
+	}
 	for name := range request.Header {
-		if strings.EqualFold(name, "X-CLIProxy-Auth-ID") {
+		if strings.EqualFold(name, "X-CLIProxy-Auth-ID") || strings.EqualFold(name, "X-CLIProxy-Single-Attempt") {
 			delete(request.Header, name)
 		}
 	}

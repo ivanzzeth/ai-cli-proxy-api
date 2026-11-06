@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/google/uuid"
 	"strings"
 	"sync/atomic"
 
@@ -51,7 +52,7 @@ var toolUseIDCounter uint64
 //
 // Returns:
 //   - [][]byte: A slice of bytes, each containing a Claude-compatible SSE payload.
-func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
+func ConvertGeminiResponseToClaude(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &Params{
 			IsGlAPIKey:       false,
@@ -90,15 +91,17 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 	if !(*param).(*Params).HasFirstResponse {
 		// Create the initial message structure with default values
 		// This follows the Claude API specification for streaming message initialization
-		messageStartTemplate := []byte(`{"type":"message_start","message":{"id":"msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet-20241022","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`)
+		messageStartTemplate := []byte(`{"type":"message_start","message":{"id":"","type":"message","role":"assistant","content":[],"model":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`)
 
-		// Override default values with actual response metadata if available
-		if modelVersionResult := gjson.GetBytes(rawJSON, "modelVersion"); modelVersionResult.Exists() {
-			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.model", modelVersionResult.String())
+		// Keep the requested alias for Sub's exact alias restoration. Missing
+		// optional Gemini IDs fall back to unique request identity, never
+		// an unrelated Claude model or a fixed/empty message ID.
+		responseModel, responseID := geminiClaudeResponseIdentity(modelName, originalRequestRawJSON, rawJSON)
+		if responseModel == "" {
+			return nil
 		}
-		if responseIDResult := gjson.GetBytes(rawJSON, "responseId"); responseIDResult.Exists() {
-			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.id", responseIDResult.String())
-		}
+		messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.model", responseModel)
+		messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.id", responseID)
 		appendEvent("message_start", string(messageStartTemplate))
 
 		(*param).(*Params).HasFirstResponse = true
@@ -293,7 +296,7 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 //
 // Returns:
 //   - []byte: A Claude-compatible JSON response.
-func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
+func ConvertGeminiResponseToClaudeNonStream(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	_ = requestRawJSON
 
 	root := gjson.ParseBytes(rawJSON)
@@ -301,8 +304,12 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 	sanitizedNameMap := util.SanitizedToolNameMap(originalRequestRawJSON)
 
 	out := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
-	out, _ = sjson.SetBytes(out, "id", root.Get("responseId").String())
-	out, _ = sjson.SetBytes(out, "model", root.Get("modelVersion").String())
+	responseModel, responseID := geminiClaudeResponseIdentity(modelName, originalRequestRawJSON, rawJSON)
+	if responseModel == "" {
+		return nil
+	}
+	out, _ = sjson.SetBytes(out, "id", responseID)
+	out, _ = sjson.SetBytes(out, "model", responseModel)
 
 	cachedTokens := root.Get("usageMetadata.cachedContentTokenCount").Int()
 	inputTokens := root.Get("usageMetadata.promptTokenCount").Int() - cachedTokens
@@ -433,4 +440,31 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 
 func ClaudeTokenCount(ctx context.Context, count int64) []byte {
 	return translatorcommon.ClaudeInputTokensJSON(count)
+}
+
+// Keep the original Messages request alias so Sub can restore its public alias.
+// The resolved model and optional Gemini version are fallbacks only when request
+// context lacks a model. Actual upstream version remains upstream evidence; no
+// unrelated model family is inferred or added to the public response.
+func geminiClaudeResponseIdentity(modelName string, originalRequest, response []byte) (string, string) {
+	model := ""
+	if candidate := gjson.GetBytes(originalRequest, "model"); candidate.Type == gjson.String {
+		model = strings.TrimSpace(candidate.String())
+	}
+	if model == "" {
+		model = strings.TrimSpace(modelName)
+	}
+	if model == "" {
+		if candidate := gjson.GetBytes(response, "modelVersion"); candidate.Type == gjson.String {
+			model = strings.TrimSpace(candidate.String())
+		}
+	}
+	id := ""
+	if candidate := gjson.GetBytes(response, "responseId"); candidate.Type == gjson.String {
+		id = strings.TrimSpace(candidate.String())
+	}
+	if id == "" {
+		id = "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	}
+	return model, id
 }

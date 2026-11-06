@@ -353,6 +353,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	lifecycle := h.newRequestLifecycleTracker(ctx, entryProtocol, normalizedModel, originalRequestedModel, true, reqMeta, execOptions.SkipInterceptorPluginID)
 	opts := coreexecutor.Options{
 		Stream:                      true,
+		SingleAttempt:               serverBridgeSingleAttempt(ctx),
 		Alt:                         alt,
 		OriginalRequest:             rawJSON,
 		SourceFormat:                sdktranslator.FromString(entryProtocol),
@@ -564,7 +565,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 
 	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
-	if h.AuthManager.HomeEnabled() {
+	if h.AuthManager.HomeEnabled() || serverBridgeSingleAttempt(ctx) {
 		maxBootstrapRetries = 0
 	}
 	for bootstrapRetries := 0; !streamCanceledBeforeRead; {

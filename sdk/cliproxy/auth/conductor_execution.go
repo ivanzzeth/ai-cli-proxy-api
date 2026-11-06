@@ -122,14 +122,24 @@ func nonReplayableImageAttempt(err error) bool {
 	return errors.As(err, &signal) && signal.NonReplayableImageAttempt()
 }
 
+// The policy is native server metadata + a current protected credential scope,
+// never an inferred capability from a model name or an unpinned client flag.
+func pinnedBridgeSingleAttempt(opts cliproxyexecutor.Options) bool {
+	enabled, _ := opts.Metadata["server_bridge_single_attempt"].(bool)
+	return opts.SingleAttempt && enabled && pinnedAuthIDFromMetadata(opts.Metadata) != "" && opts.NativeVoiceOperation == ""
+}
+
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if opts.SingleAttempt && (!opts.NativeVoiceOperation.Valid() || !opts.NativeVoiceOperation.Unsafe()) {
+	if opts.SingleAttempt && !pinnedBridgeSingleAttempt(opts) && (!opts.NativeVoiceOperation.Valid() || !opts.NativeVoiceOperation.Unsafe()) {
 		return cliproxyexecutor.Response{}, &Error{Code: "invalid_voice_operation", Message: "single attempt is only supported for fixed unsafe Voice operations"}
 	}
 	if opts.NativeVoiceOperation != "" && m.HomeEnabled() {
 		return cliproxyexecutor.Response{}, &Error{Code: "voice_not_supported", Message: "Voice is not supported in Home mode"}
+	}
+	if pinnedBridgeSingleAttempt(opts) && m.HomeEnabled() {
+		return cliproxyexecutor.Response{}, &Error{Code: "bridge_policy_unavailable", Message: "server bridge single-attempt is not supported in Home mode"}
 	}
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
@@ -165,6 +175,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			if opts.SingleAttempt {
 				return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(errExec)
 			}
+		}
+		if pinnedBridgeSingleAttempt(opts) {
+			return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(errExec)
 		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterErrorWithAttempted(ctx, opts, errExec, attempt, normalized, retryModel, maxWait, -1, defaultRequestRetry, roundAttempted)
@@ -250,6 +263,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if pinnedBridgeSingleAttempt(opts) && m.HomeEnabled() {
+		return nil, &Error{Code: "bridge_policy_unavailable", Message: "server bridge single-attempt is not supported in Home mode"}
+	}
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	if m.HomeEnabled() {
@@ -280,6 +296,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 		if hasUpstreamExecutionAttempt(errStream) {
 			preferredUpstreamErr = errStream
+		}
+		if pinnedBridgeSingleAttempt(opts) {
+			return nil, unwrapExecutionBoundaryError(errStream)
 		}
 		if m.HomeEnabled() && retryRoundPending {
 			if wait, okWait := pendingHomeRetryRoundDelay(errStream, maxWait, &homeRetryLimit, pinnedAuthIDFromMetadata(opts.Metadata) == ""); okWait && m.homeRetryAllowed(attempt-1, homeRetryLimit) {
@@ -616,7 +635,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					if nonReplayableImageAttempt(errExec) {
 						return nil, false
 					}
-					if opts.SingleAttempt && hasUpstreamExecutionAttempt(errExec) {
+					if opts.SingleAttempt && (pinnedBridgeSingleAttempt(opts) || hasUpstreamExecutionAttempt(errExec)) {
 						return nil, false
 					}
 					return m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized)
@@ -664,7 +683,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if nonReplayableImageAttempt(errExec) {
 					return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
 				}
-				if opts.SingleAttempt && hasUpstreamExecutionAttempt(errExec) {
+				if opts.SingleAttempt && (pinnedBridgeSingleAttempt(opts) || hasUpstreamExecutionAttempt(errExec)) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				if okAction {
@@ -1198,6 +1217,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errStream != nil {
 			if hasUpstreamExecutionAttempt(errStream) {
 				upstreamErr = errStream
+			}
+			if pinnedBridgeSingleAttempt(opts) {
+				return nil, errStream
 			}
 			if selection != nil {
 				excludeAuth := shouldExcludeHomeAuthAfterStreamError(execCtx, auth, errStream)

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestConvertGeminiResponseToClaude_SignatureOnlyPartDoesNotOpenEmptyTextBlock(t *testing.T) {
@@ -288,5 +289,78 @@ func TestConvertGeminiResponseToClaudeNonStream_UsageWithCachedContentTokenCount
 	outputTokens := outputJSON.Get("usage.output_tokens").Int()
 	if outputTokens != 7 {
 		t.Fatalf("expected usage.output_tokens = 7, got %d. Output: %s", outputTokens, string(output))
+	}
+}
+
+func TestGeminiClaudeResponseIdentityUsesActualContext(t *testing.T) {
+	base := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`)
+	for _, tc := range []struct{ name, version, original, resolved, want string }{
+		{"actual-version", "gemini-version", "public-alias", "gemini-resolved", "public-alias"},
+		{"optional-version-missing", "", "public-alias", "gemini-resolved", "public-alias"},
+		{"resolved-fallback", "", "", "gemini-resolved", "gemini-resolved"},
+		{"resolved-before-version", "gemini-version", "", "gemini-resolved", "gemini-resolved"},
+		{"version-only", "gemini-version", "", "", "gemini-version"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := append([]byte(nil), base...)
+			if tc.version != "" {
+				response, _ = sjson.SetBytes(response, "modelVersion", tc.version)
+			}
+			request, _ := sjson.SetBytes([]byte(`{}`), "model", tc.original)
+			output := ConvertGeminiResponseToClaudeNonStream(context.Background(), tc.resolved, request, nil, response, nil)
+			if got := gjson.GetBytes(output, "model").String(); got != tc.want {
+				t.Fatalf("JSON model %q want%q", got, tc.want)
+			}
+			id := gjson.GetBytes(output, "id").String()
+			if !strings.HasPrefix(id, "msg_") {
+				t.Fatalf("missing unique JSON fallback ID: %q", id)
+			}
+			other := ConvertGeminiResponseToClaudeNonStream(context.Background(), tc.resolved, request, nil, response, nil)
+			if gjson.GetBytes(other, "id").String() == id {
+				t.Fatal("independent responses reused fallback ID")
+			}
+			var param any
+			chunks := ConvertGeminiResponseToClaude(context.Background(), tc.resolved, request, nil, response, &param)
+			found := false
+			for _, chunk := range chunks {
+				for _, line := range bytes.Split(chunk, []byte("\n")) {
+					if !bytes.HasPrefix(line, []byte("data: ")) {
+						continue
+					}
+					event := bytes.TrimPrefix(line, []byte("data: "))
+					if gjson.GetBytes(event, "type").String() != "message_start" {
+						continue
+					}
+					found = true
+					if got := gjson.GetBytes(event, "message.model").String(); got != tc.want {
+						t.Fatalf("SSE model %q want%q", got, tc.want)
+					}
+					if !strings.HasPrefix(gjson.GetBytes(event, "message.id").String(), "msg_") {
+						t.Fatal("missing unique SSE fallback ID")
+					}
+				}
+			}
+			if !found {
+				t.Fatal("message_start was not reached")
+			}
+		})
+	}
+}
+func TestGeminiClaudeResponseIdentityPreservesProvidedID(t *testing.T) {
+	response := []byte(`{"responseId":"provider-response-A","modelVersion":"gemini-real"}`)
+	model, id := geminiClaudeResponseIdentity("gemini-resolved", []byte(`{"model":"public-alias"}`), response)
+	if model != "public-alias" || id != "provider-response-A" {
+		t.Fatalf("real identity overwritten: %q %q", model, id)
+	}
+}
+
+func TestGeminiClaudeResponseMissingAllModelContextFailsClosed(t *testing.T) {
+	raw := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`)
+	if output := ConvertGeminiResponseToClaudeNonStream(context.Background(), "", nil, nil, raw, nil); output != nil {
+		t.Fatalf("missing identity produced success JSON: %s", output)
+	}
+	var param any
+	if chunks := ConvertGeminiResponseToClaude(context.Background(), "", nil, nil, raw, &param); chunks != nil {
+		t.Fatalf("missing identity produced success SSE: %q", chunks)
 	}
 }

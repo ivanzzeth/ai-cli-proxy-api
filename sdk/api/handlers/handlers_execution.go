@@ -97,7 +97,7 @@ func (h *BaseAPIHandler) executeResponseWithAuthManagerFormats(ctx context.Conte
 	opts := coreexecutor.Options{
 		Stream:                      false,
 		NativeVoiceOperation:        execOptions.NativeVoiceOperation,
-		SingleAttempt:               execOptions.SingleAttempt,
+		SingleAttempt:               execOptions.SingleAttempt || serverBridgeSingleAttempt(ctx),
 		Alt:                         alt,
 		OriginalRequest:             rawJSON,
 		SourceFormat:                sdktranslator.FromString(entryProtocol),

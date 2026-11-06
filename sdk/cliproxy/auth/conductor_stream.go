@@ -210,6 +210,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	executor = executorForAuth(executor, auth)
+	if pinnedBridgeSingleAttempt(opts) {
+		allowRetry = false
+		if len(execModels) > 1 {
+			execModels = execModels[:1]
+		}
+	}
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
 	var lastErr error
 	var upstreamErr error
