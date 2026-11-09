@@ -136,6 +136,12 @@ func normalizeSeedreamGeneration(body []byte, endpoint, profile, selectedModel s
 	// Map decoding can accept duplicate keys; always overwrite model from the
 	// selected native Auth/model route, never from a later customer JSON key.
 	fields["model"], _ = json.Marshal(selectedModel)
+	// Ask Ark for the exact square behind the customer's priced tier.
+	wireSize := "1024x1024"
+	if size == "2K" {
+		wireSize = "2048x2048"
+	}
+	fields["size"], _ = json.Marshal(wireSize)
 	delete(fields, "n")
 	delete(fields, "stream")
 	return json.Marshal(fields)
@@ -159,8 +165,7 @@ func verifySeedreamSingleResult(body []byte, requested []byte) error {
 	if (row.URL == "") == (row.B64 == "") {
 		return fmt.Errorf("one image result required")
 	}
-	tier := map[string]string{"1K": "1K", "1024x1024": "1K", "2K": "2K", "2048x2048": "2K"}[row.Size]
-	if tier == "" || tier != req.Size {
+	if (req.Size != "1024x1024" && req.Size != "2048x2048") || row.Size != req.Size {
 		return fmt.Errorf("unverified image size; no guessed tier")
 	}
 	return nil

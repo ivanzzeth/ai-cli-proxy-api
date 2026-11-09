@@ -136,28 +136,29 @@ func seedreamTestExecutor(origin, model, profile string) (*OpenAICompatExecutor,
 func TestSeedreamProfileJSONContract(t *testing.T) {
 	for _, tc := range []struct {
 		name, body string
-		valid      bool
+		wantSize   string
 	}{
-		{"one", `{"model":"ignored","prompt":"draw","size":"1K","n":1}`, true},
-		{"two_k", `{"model":"ignored","prompt":"draw","size":"2K","watermark":false,"response_format":"b64_json","output_format":"png"}`, true},
-		{"fractional_n", `{"prompt":"draw","size":"1K","n":1.9}`, false},
-		{"lexical_one_decimal_restricted", `{"prompt":"draw","size":"1K","n":1.0}`, false},
-		{"null_n", `{"prompt":"draw","size":"1K","n":null}`, false},
-		{"null_stream", `{"prompt":"draw","size":"1K","stream":null}`, false},
-		{"true_stream", `{"prompt":"draw","size":"1K","stream":true}`, false},
-		{"null_watermark", `{"prompt":"draw","size":"1K","watermark":null}`, false},
-		{"one_point_five_k", `{"prompt":"draw","size":"1.5K"}`, false},
-		{"image_input_P2", `{"prompt":"draw","size":"1K","image":"https://example.invalid/image"}`, false},
-		{"sequential", `{"prompt":"draw","size":"1K","sequential_image_generation":"auto"}`, false},
-		{"duplicate_size", `{"prompt":"draw","size":"1K","size":"2K"}`, false},
-		{"escaped_duplicate", `{"prompt":"draw","size":"1K","si\u007ae":"2K"}`, false},
-		{"duplicate_model", `{"model":"a","model":"b","prompt":"draw","size":"1K"}`, false},
-		{"duplicate_stream", `{"prompt":"draw","size":"1K","stream":false,"stream":false}`, false},
-		{"two_documents", `{"prompt":"draw","size":"1K"} {}`, false},
+		{"one", `{"model":"ignored","prompt":"draw","size":"1K","n":1}`, "1024x1024"},
+		{"two_k", `{"model":"ignored","prompt":"draw","size":"2K","watermark":false,"response_format":"b64_json","output_format":"png"}`, "2048x2048"},
+		{"fractional_n", `{"prompt":"draw","size":"1K","n":1.9}`, ""},
+		{"lexical_one_decimal_restricted", `{"prompt":"draw","size":"1K","n":1.0}`, ""},
+		{"null_n", `{"prompt":"draw","size":"1K","n":null}`, ""},
+		{"null_stream", `{"prompt":"draw","size":"1K","stream":null}`, ""},
+		{"true_stream", `{"prompt":"draw","size":"1K","stream":true}`, ""},
+		{"null_watermark", `{"prompt":"draw","size":"1K","watermark":null}`, ""},
+		{"pixel_size_is_upstream_only", `{"prompt":"draw","size":"1024x1024"}`, ""},
+		{"one_point_five_k", `{"prompt":"draw","size":"1.5K"}`, ""},
+		{"image_input_P2", `{"prompt":"draw","size":"1K","image":"https://example.invalid/image"}`, ""},
+		{"sequential", `{"prompt":"draw","size":"1K","sequential_image_generation":"auto"}`, ""},
+		{"duplicate_size", `{"prompt":"draw","size":"1K","size":"2K"}`, ""},
+		{"escaped_duplicate", `{"prompt":"draw","size":"1K","si\u007ae":"2K"}`, ""},
+		{"duplicate_model", `{"model":"a","model":"b","prompt":"draw","size":"1K"}`, ""},
+		{"duplicate_stream", `{"prompt":"draw","size":"1K","stream":false,"stream":false}`, ""},
+		{"two_documents", `{"prompt":"draw","size":"1K"} {}`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := normalizeSeedreamGeneration([]byte(tc.body), "/images/generations", seedreamTestProfile, seedreamTestModel)
-			if !tc.valid {
+			if tc.wantSize == "" {
 				if err == nil {
 					t.Fatal("invalid profile request accepted")
 				}
@@ -169,6 +170,10 @@ func TestSeedreamProfileJSONContract(t *testing.T) {
 			var value map[string]json.RawMessage
 			if err := json.Unmarshal(got, &value); err != nil {
 				t.Fatal(err)
+			}
+			var size string
+			if err := json.Unmarshal(value["size"], &size); err != nil || size != tc.wantSize {
+				t.Fatalf("wire size=%q want=%q err=%v", size, tc.wantSize, err)
 			}
 			var model string
 			if err := json.Unmarshal(value["model"], &model); err != nil {
@@ -197,7 +202,9 @@ func TestSeedreamExecutorActualHTTP(t *testing.T) {
 		{name: "zero_results", reply: `{"data":[]}`, status: 200, wantError: true},
 		{name: "two_results", reply: `{"data":[{"url":"a","size":"1K"},{"url":"b","size":"1K"}]}`, status: 200, wantError: true},
 		{name: "missing_size", reply: `{"data":[{"b64_json":"aGVsbG8="}]}`, status: 200, wantError: true},
-		{name: "mismatched_size", reply: `{"data":[{"b64_json":"aGVsbG8=","size":"2K"}]}`, status: 200, wantError: true},
+		{name: "mismatched_size", reply: `{"data":[{"b64_json":"aGVsbG8=","size":"2048x2048"}]}`, status: 200, wantError: true},
+		{name: "rectangular_size", reply: `{"data":[{"b64_json":"aGVsbG8=","size":"1152x864"}]}`, status: 200, wantError: true},
+		{name: "tier_without_dimensions", reply: `{"data":[{"b64_json":"aGVsbG8=","size":"1K"}]}`, status: 200, wantError: true},
 		{name: "unknown_tier", reply: `{"data":[{"b64_json":"aGVsbG8=","size":"1.5K"}]}`, status: 200, wantError: true},
 		{name: "upstream_401", reply: `{"error":{"message":"synthetic"}}`, status: 401, wantError: true},
 		{name: "commit_then_EOF", closeAfterCommit: true, wantError: true},
@@ -217,8 +224,8 @@ func TestSeedreamExecutorActualHTTP(t *testing.T) {
 				if err := json.Unmarshal(raw, &value); err != nil {
 					t.Error(err)
 				}
-				if value["model"] != seedreamTestModel {
-					t.Errorf("model=%v", value["model"])
+				if value["model"] != seedreamTestModel || value["size"] != "1024x1024" {
+					t.Errorf("unexpected model/size: %v", value)
 				}
 				if _, ok := value["n"]; ok {
 					t.Error("n leaked")
@@ -358,14 +365,14 @@ func TestSeedreamFlashPlanAliasHTTP(t *testing.T) {
 		if err := json.Unmarshal(raw, &value); err != nil {
 			t.Error(err)
 		}
-		if value["model"] != model || value["size"] != "2K" {
+		if value["model"] != model || value["size"] != "2048x2048" {
 			t.Errorf("unexpected model/size: %v", value)
 		}
 		if _, ok := value["n"]; ok {
 			t.Error("OpenAI n must be normalized away")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"data":[{"b64_json":"aGVsbG8=","size":"2K"}]}`)
+		_, _ = io.WriteString(w, `{"data":[{"b64_json":"aGVsbG8=","size":"2048x2048"}]}`)
 	}))
 	defer provider.Close()
 	executor, auth := seedreamTestExecutor(provider.URL+"/api/plan/v3", model, "ark-agent-plan-seedream-5flash-v1")
