@@ -91,6 +91,11 @@ func (s *Server) setupRoutes() {
 		v1.GET("/live/:call_id", s.handlers.RejectServerCredentialPin(), s.codexLiveHandler.HandleSideband)
 	}
 
+	seedance := s.engine.Group("/api/v3/contents/generations/tasks")
+	seedance.Use(AuthMiddleware(s.accessManager), s.handlers.ServerCredentialPinMiddleware())
+	seedance.POST("", openaiHandlers.SeedanceTask)
+	seedance.GET("/:task_id", openaiHandlers.SeedanceTask)
+
 	realtimeAuth := realtimeAuthMiddleware(s.accessManager, s.codexLiveHandler)
 	standardAuth := realtimeStandardAuthMiddleware(s.accessManager)
 	s.engine.GET("/v1/realtime", realtimeAuth, s.handlers.RejectServerCredentialPin(), s.codexLiveHandler.HandleRealtimeWebsocket)

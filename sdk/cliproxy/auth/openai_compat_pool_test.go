@@ -11,6 +11,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 const openAICompatPoolProviderKey = "openai-compatible-pool"
@@ -915,6 +916,50 @@ func TestSeedreamAttemptStopsRefreshCredentialAndRounds(t *testing.T) {
 			}
 			if base.RefreshCalls() != 0 {
 				t.Fatalf("refresh=%d", base.RefreshCalls())
+			}
+		})
+	}
+}
+
+type seedanceStopTestError struct{ status int }
+
+func (e seedanceStopTestError) Error() string                      { return "synthetic Seedance outcome unknown" }
+func (e seedanceStopTestError) StatusCode() int                    { return e.status }
+func (e seedanceStopTestError) NonReplayableSeedanceAttempt() bool { return true }
+
+type seedanceStopTestExecutor struct {
+	*unauthorizedRefreshExecutor
+	status int
+}
+
+func (e *seedanceStopTestExecutor) Execute(_ context.Context, a *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.executeCalls = append(e.executeCalls, a.ID)
+	e.mu.Unlock()
+	return cliproxyexecutor.Response{}, seedanceStopTestError{status: e.status}
+}
+
+func TestSeedanceAttemptStopsRefreshCredentialAndRounds(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusBadGateway} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			manager, base, _, pinned, model := newUnauthorizedRefreshFixture(t, false)
+			executor := &seedanceStopTestExecutor{unauthorizedRefreshExecutor: base, status: status}
+			manager.RegisterExecutor(executor)
+			manager.SetRetryConfig(3, 0, 3)
+			format := sdktranslator.FromString(string(registry.UpstreamProtocolVolcengineArkSeedanceV3))
+			opts := cliproxyexecutor.Options{SourceFormat: format, ResponseFormat: format, SingleAttempt: true}
+			if _, err := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, opts); err == nil || len(base.ExecuteCalls()) != 0 {
+				t.Fatalf("unpinned execution reached executor: %v", err)
+			}
+			opts.Metadata = map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: pinned.ID}
+			response, err := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, opts)
+			var stop seedanceStopTestError
+			if !errors.As(err, &stop) || stop.status != status || len(response.Payload) != 0 {
+				t.Fatalf("result=%#v err=%v", response, err)
+			}
+			calls := base.ExecuteCalls()
+			if len(calls) != 1 || calls[0] != pinned.ID || base.RefreshCalls() != 0 {
+				t.Fatalf("credential/retry violation: calls=%v refresh=%d", calls, base.RefreshCalls())
 			}
 		})
 	}

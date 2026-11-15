@@ -56,14 +56,15 @@ func SeedreamImageProfile(profile string) *ImageGenerationSupport {
 type UpstreamProtocol string
 
 const (
-	UpstreamProtocolLegacy              UpstreamProtocol = ""
-	UpstreamProtocolXAIVoiceHTTP        UpstreamProtocol = "xai-voice-http"
-	UpstreamProtocolVolcengineArkTextV3 UpstreamProtocol = "volcengine-ark-text-v3"
-	UpstreamProtocolVolcengineTTSV3HTTP UpstreamProtocol = "volcengine-tts-v3-http"
+	UpstreamProtocolLegacy                  UpstreamProtocol = ""
+	UpstreamProtocolXAIVoiceHTTP            UpstreamProtocol = "xai-voice-http"
+	UpstreamProtocolVolcengineArkTextV3     UpstreamProtocol = "volcengine-ark-text-v3"
+	UpstreamProtocolVolcengineTTSV3HTTP     UpstreamProtocol = "volcengine-tts-v3-http"
+	UpstreamProtocolVolcengineArkSeedanceV3 UpstreamProtocol = "volcengine-ark-seedance-v3"
 )
 
 func (p UpstreamProtocol) Known() bool {
-	return p == UpstreamProtocolXAIVoiceHTTP || p == UpstreamProtocolLegacy || p == UpstreamProtocolVolcengineArkTextV3 || p == UpstreamProtocolVolcengineTTSV3HTTP
+	return p == UpstreamProtocolXAIVoiceHTTP || p == UpstreamProtocolLegacy || p == UpstreamProtocolVolcengineArkTextV3 || p == UpstreamProtocolVolcengineTTSV3HTTP || p == UpstreamProtocolVolcengineArkSeedanceV3
 }
 
 // AudioSpeechSupport describes an explicit native speech contract, not entitlement.

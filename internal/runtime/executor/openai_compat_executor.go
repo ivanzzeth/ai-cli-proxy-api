@@ -1158,6 +1158,15 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	if opts.SourceFormat.String() == string(registry.UpstreamProtocolVolcengineArkSeedanceV3) {
+		if protocol != registry.UpstreamProtocolVolcengineArkSeedanceV3 {
+			return cliproxyexecutor.Response{}, statusErr{code: 400, msg: "explicit Seedance upstream_protocol required"}
+		}
+		return e.executeVolcengineSeedance(ctx, auth, req, opts)
+	}
+	if protocol == registry.UpstreamProtocolVolcengineArkSeedanceV3 {
+		return cliproxyexecutor.Response{}, statusErr{code: 400, msg: "Seedance protocol requires the native task route"}
+	}
 	if opts.SourceFormat.String() == "openai-speech" {
 		if protocol != registry.UpstreamProtocolVolcengineTTSV3HTTP {
 			return cliproxyexecutor.Response{}, statusErr{code: 400, msg: "explicit Volcengine TTS upstream_protocol required"}
@@ -1191,6 +1200,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if err != nil {
 		return nil, err
 	}
+	if protocol == registry.UpstreamProtocolVolcengineArkSeedanceV3 || opts.SourceFormat.String() == string(registry.UpstreamProtocolVolcengineArkSeedanceV3) {
+		return nil, statusErr{code: 400, msg: "Seedance does not support streaming"}
+	}
 	if protocol == registry.UpstreamProtocolVolcengineTTSV3HTTP || opts.SourceFormat.String() == "openai-speech" {
 		return nil, statusErr{code: 400, msg: "synchronous speech only"}
 	}
@@ -1211,6 +1223,9 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	}
 	if protocol == registry.UpstreamProtocolVolcengineTTSV3HTTP {
 		return cliproxyexecutor.Response{}, statusErr{code: 400, msg: "audio billing does not use token counts"}
+	}
+	if protocol == registry.UpstreamProtocolVolcengineArkSeedanceV3 || opts.SourceFormat.String() == string(registry.UpstreamProtocolVolcengineArkSeedanceV3) {
+		return cliproxyexecutor.Response{}, statusErr{code: 400, msg: "Seedance does not support token counting"}
 	}
 	return e.countCompatibleTokens(ctx, auth, req, opts)
 }

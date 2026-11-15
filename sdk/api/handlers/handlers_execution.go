@@ -11,7 +11,9 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -56,6 +58,9 @@ func (h *BaseAPIHandler) executeResponseWithAuthManagerFormats(ctx context.Conte
 		return coreexecutor.Response{}, failure
 	}
 	ctx = validated
+	if entryProtocol == string(registry.UpstreamProtocolVolcengineArkSeedanceV3) {
+		return h.executeSeedanceTask(ctx, modelName, rawJSON, alt, exitProtocol, execOptions)
+	}
 	if execOptions.NativeVoiceOperation != "" && !execOptions.NativeVoiceOperation.Valid() {
 		return coreexecutor.Response{}, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("unknown native voice operation")}
 	}
@@ -180,6 +185,45 @@ func (h *BaseAPIHandler) executeResponseWithAuthManagerFormats(ctx context.Conte
 	resp.Headers = responseHeaders
 	resp.StatusCode = status
 	return resp, nil
+}
+
+// executeSeedanceTask preserves the protected binding and exact Ark response
+// through the native Manager, without model routers or body interceptors.
+func (h *BaseAPIHandler) executeSeedanceTask(ctx context.Context, model string, body []byte, taskID, exitProtocol string, execOptions modelExecutionOptions) (coreexecutor.Response, *interfaces.ErrorMessage) {
+	protocol := registry.UpstreamProtocolVolcengineArkSeedanceV3
+	pin := protectedServerCredentialPin(ctx)
+	if pin == "" || h.AuthManager == nil || h.AuthManager.HomeEnabled() || !execOptions.SingleAttempt || exitProtocol != string(protocol) || execOptions.ProxyURL != "" || execOptions.ForcedProvider != "" || execOptions.AuthSelectionModel != "" || execOptions.NativeVoiceOperation != "" {
+		return coreexecutor.Response{}, serverCredentialPinError(http.StatusBadRequest, "protected native Seedance execution required")
+	}
+	credential, ok := h.AuthManager.GetByID(pin)
+	if !ok || credential == nil || credential.AuthKind() != coreauth.AuthKindAPIKey || credential.AuthSourceKind() != coreauth.AuthSourceConfig {
+		return coreexecutor.Response{}, serverCredentialPinError(http.StatusBadRequest, "configured Seedance credential required")
+	}
+
+	for _, info := range registry.GetGlobalRegistry().GetModelsForClient(pin) {
+		if info != nil && info.ID == model && info.UpstreamProtocol == protocol {
+			meta := map[string]any{
+				coreexecutor.PinnedAuthMetadataKey:     pin,
+				coreexecutor.RequestedModelMetadataKey: model,
+			}
+			format := sdktranslator.FromString(string(protocol))
+			response, err := h.AuthManager.Execute(ctx, []string{credential.Provider}, coreexecutor.Request{Model: model, Payload: body}, coreexecutor.Options{
+				SourceFormat: format, ResponseFormat: format, Metadata: meta, SingleAttempt: true, Alt: taskID,
+			})
+			if err != nil {
+				return coreexecutor.Response{}, executionErrorMessage(err)
+			}
+			safe := make(http.Header)
+			for _, name := range []string{"Content-Type", "X-Request-Id"} {
+				if value := response.Headers.Get(name); value != "" {
+					safe.Set(name, value)
+				}
+			}
+			response.Headers = safe
+			return response, nil
+		}
+	}
+	return coreexecutor.Response{}, serverCredentialPinError(http.StatusBadRequest, "exact registered Seedance model required")
 }
 
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.

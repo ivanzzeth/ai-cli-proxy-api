@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
@@ -117,19 +118,34 @@ func preferredExecutionAttemptError(fallback, upstream error) error {
 	return markUpstreamExecutionAttempt(upstream)
 }
 
-func nonReplayableImageAttempt(err error) bool {
-	var signal interface{ NonReplayableImageAttempt() bool }
-	return errors.As(err, &signal) && signal.NonReplayableImageAttempt()
+func nonReplayableMediaAttempt(err error) bool {
+	var image interface{ NonReplayableImageAttempt() bool }
+	if errors.As(err, &image) && image.NonReplayableImageAttempt() {
+		return true
+	}
+	var seedance interface{ NonReplayableSeedanceAttempt() bool }
+	return errors.As(err, &seedance) && seedance.NonReplayableSeedanceAttempt()
+}
+
+func isSeedanceExecution(opts cliproxyexecutor.Options) bool {
+	return opts.SourceFormat.String() == string(registry.UpstreamProtocolVolcengineArkSeedanceV3)
 }
 
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if opts.SingleAttempt && (!opts.NativeVoiceOperation.Valid() || !opts.NativeVoiceOperation.Unsafe()) {
+	if opts.SingleAttempt && !isSeedanceExecution(opts) && (!opts.NativeVoiceOperation.Valid() || !opts.NativeVoiceOperation.Unsafe()) {
 		return cliproxyexecutor.Response{}, &Error{Code: "invalid_voice_operation", Message: "single attempt is only supported for fixed unsafe Voice operations"}
 	}
 	if opts.NativeVoiceOperation != "" && m.HomeEnabled() {
 		return cliproxyexecutor.Response{}, &Error{Code: "voice_not_supported", Message: "Voice is not supported in Home mode"}
+	}
+	if isSeedanceExecution(opts) {
+		if !opts.SingleAttempt || opts.Stream || opts.NativeVoiceOperation != "" || m.HomeEnabled() || pinnedAuthIDFromMetadata(opts.Metadata) == "" || len(providers) != 1 || opts.ProxyURL != "" {
+			return cliproxyexecutor.Response{}, &Error{Code: "invalid_seedance_execution", Message: "Seedance requires a pinned native single attempt", HTTPStatus: http.StatusBadRequest}
+		}
+		response, err := m.executeMixedOnce(ctx, m.normalizeProviders(providers), req, opts, 1, 0, 0)
+		return response, unwrapExecutionBoundaryError(err)
 	}
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
@@ -154,7 +170,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if errExec == nil {
 			return resp, nil
 		}
-		if nonReplayableImageAttempt(errExec) {
+		if nonReplayableMediaAttempt(errExec) {
 			return cliproxyexecutor.Response{}, unwrapExecutionBoundaryError(errExec)
 		}
 		if isRequestTerminatedError(errExec) || isRequestStopError(errExec) {
@@ -542,6 +558,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		execCtx = newUpstreamAttemptContext(execCtx)
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
+		if isSeedanceExecution(opts) && (auth.ID != pinnedAuthIDFromMetadata(opts.Metadata) || len(models) != 1 || models[0] != req.Model) {
+			return cliproxyexecutor.Response{}, &Error{Code: "invalid_seedance_model", Message: "Seedance requires one exact configured wire model", HTTPStatus: http.StatusBadRequest}
+		}
 		if len(models) == 0 {
 			continue
 		}
@@ -613,7 +632,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				refreshCtx := newUpstreamAttemptContext(execCtx)
 				if refreshed, okRefresh := func() (*Auth, bool) {
-					if nonReplayableImageAttempt(errExec) {
+					if isSeedanceExecution(opts) || nonReplayableMediaAttempt(errExec) {
 						return nil, false
 					}
 					if opts.SingleAttempt && hasUpstreamExecutionAttempt(errExec) {
@@ -661,7 +680,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				} else {
 					m.MarkResult(execCtx, result)
 				}
-				if nonReplayableImageAttempt(errExec) {
+				if isSeedanceExecution(opts) || nonReplayableMediaAttempt(errExec) {
 					return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
 				}
 				if opts.SingleAttempt && hasUpstreamExecutionAttempt(errExec) {
@@ -687,6 +706,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			if isSeedanceExecution(opts) {
+				return resp, nil
+			}
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			return resp, nil
