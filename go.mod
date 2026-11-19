@@ -11,6 +11,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-gonic/gin v1.10.1
 	github.com/go-git/go-git/v6 v6.0.0-alpha.4.0.20260520124234-0860a7d8a164
+	github.com/go-openapi/jsonpointer v0.21.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/jackc/pgx/v5 v5.9.2
@@ -26,6 +27,7 @@ require (
 	github.com/pion/webrtc/v4 v4.2.17
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/refraction-networking/utls v1.8.2
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/sirupsen/logrus v1.9.3
 	github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966
 	github.com/tidwall/gjson v1.18.0
@@ -44,6 +46,9 @@ require (
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dlclark/regexp2/v2 v2.5.1 // indirect
+	github.com/go-openapi/swag v0.23.0 // indirect
+	github.com/josharian/intern v1.0.0 // indirect
+	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/miekg/dns v1.1.43 // indirect
 	github.com/pion/datachannel v1.6.2 // indirect
 	github.com/pion/dtls/v3 v3.1.5 // indirect
