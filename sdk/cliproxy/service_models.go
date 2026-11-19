@@ -863,8 +863,20 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType, metadataCha
 		if resolved := modelconfig.ResolveModelInfo(name, modelType, model.GetThinking()); resolved.Thinking != nil {
 			info.Thinking = resolved.Thinking
 		}
-		if staticInfo := registry.LookupStaticModelInfoByChannel(name, metadataChannel); staticInfo != nil && staticInfo.NativeCapabilities != nil {
-			info.NativeCapabilities = cloneModelInfoForCatalogRoute(staticInfo).NativeCapabilities
+		if staticInfo := registry.LookupStaticModelInfoByChannel(name, metadataChannel); staticInfo != nil {
+			declared := cloneModelInfoForCatalogRoute(staticInfo)
+			if declared.NativeCapabilities != nil {
+				info.NativeCapabilities = declared.NativeCapabilities
+			}
+			// Only the explicit native xAI declaration can assign this wire contract.
+			if metadataChannel == "xai" && declared.UpstreamProtocol == registry.UpstreamProtocolXAIVoiceHTTP && declared.AudioSpeech != nil {
+				info.UpstreamProtocol = declared.UpstreamProtocol
+				info.AudioSpeech = declared.AudioSpeech
+				info.Type = "openai-audio-speech"
+				info.Thinking = nil
+				info.SupportedInputModalities = []string{"text"}
+				info.SupportedOutputModalities = []string{"audio"}
+			}
 		}
 		out = append(out, info)
 	}

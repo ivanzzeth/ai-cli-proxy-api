@@ -1217,3 +1217,43 @@ func TestVoiceProtocolResponseStatusLegacyZeroAndActualSuccess(t *testing.T) {
 		})
 	}
 }
+
+func TestSpeechResponseUsesTrustedSourceAndRequestedCodec(t *testing.T) {
+	for _, scenario := range []string{"xai-wav", "xai-wrong-codec", "xai-fake-words", "ark-no-words", "ark-actual-words", "untyped"} {
+		t.Run(scenario, func(t *testing.T) {
+			metadata := map[string]any{"upstream_protocol": "xai-voice-http", "speech_usage_source": "request_estimated_characters"}
+			headers := http.Header{"Content-Type": []string{"audio/wav"}}
+			switch scenario {
+			case "xai-wrong-codec":
+				headers.Set("Content-Type", "audio/mpeg")
+			case "xai-fake-words":
+				headers.Set("X-CLIProxy-Speech-Text-Words", "9")
+			case "ark-no-words", "ark-actual-words":
+				metadata = map[string]any{"upstream_protocol": "volcengine-tts-v3-http", "speech_usage_source": "upstream_actual_words"}
+				headers.Set("Content-Type", "audio/mpeg")
+				if scenario == "ark-actual-words" {
+					headers.Set("X-CLIProxy-Speech-Text-Words", "7")
+				}
+			case "untyped":
+				metadata = nil
+			}
+			executor := &modelExecutionCaptureExecutor{provider: "speech-metadata", execute: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+				return coreexecutor.Response{StatusCode: 200, Payload: []byte("audio-fixture"), Headers: headers, Metadata: metadata}, nil
+			}}
+			handler := newModelExecutionHandler(t, "speech-metadata", executor, &sdkconfig.SDKConfig{})
+			format := "wav"
+			if strings.HasPrefix(scenario, "ark-") {
+				format = "mp3"
+			}
+			response, failure := handler.ExecuteProtocolWithAuthManager(context.Background(), ProtocolExecutionRequest{EntryProtocol: "openai-speech", ExitProtocol: "openai-speech", Model: "speech-metadata", Body: []byte(`{"model":"speech-metadata","input":"hello","voice":"eve","response_format":"` + format + `"}`), NativeVoiceOperation: coreexecutor.NativeVoiceTTS, SingleAttempt: true})
+			success := scenario == "xai-wav" || scenario == "ark-actual-words"
+			if success {
+				if failure != nil || string(response.Body) != "audio-fixture" {
+					t.Fatalf("valid source failed: %v", failure)
+				}
+			} else if failure == nil {
+				t.Fatal("unverified usage source/codec accepted")
+			}
+		})
+	}
+}

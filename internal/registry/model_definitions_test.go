@@ -345,3 +345,23 @@ func TestGetDevinModelsFallback(t *testing.T) {
 		t.Errorf("info.DisplayName = %q, want SWE-2", info.DisplayName)
 	}
 }
+
+func TestRealGrokTTSHasExplicitSpeechContract(t *testing.T) {
+	var speech *ModelInfo
+	for _, model := range GetXAIModels() {
+		if model.ID == "grok-tts" {
+			speech = model
+		}
+	}
+	if speech == nil || speech.UpstreamProtocol != UpstreamProtocolXAIVoiceHTTP || speech.AudioSpeech == nil || speech.AudioSpeech.Profile != "xai-grok-tts-v1" || speech.AudioSpeech.UsageSource != "request_estimated_characters" {
+		t.Fatal("real xAI TTS contract missing")
+	}
+	if speech.AudioSpeech.MinSpeed != 0.7 || speech.AudioSpeech.MaxSpeed != 1.5 || speech.Thinking != nil {
+		t.Fatal("audio model advertised text capabilities or wrong speed")
+	}
+	for _, model := range GetXAIModels() {
+		if model.ID != "grok-tts" && model.AudioSpeech != nil {
+			t.Fatalf("unrelated model gained speech: %s", model.ID)
+		}
+	}
+}

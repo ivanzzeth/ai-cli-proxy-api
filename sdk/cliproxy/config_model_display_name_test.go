@@ -106,3 +106,17 @@ func TestBuildConfigModelsDisplayNameFallback(t *testing.T) {
 		t.Fatalf("DisplayName = %q, want upstream model name", model.DisplayName)
 	}
 }
+
+func TestXAIConfiguredSpeechAliasRetainsDeclaredUpstreamContract(t *testing.T) {
+	models := buildXAIConfigModels(&config.XAIKey{Models: []config.XAIModel{{Name: "grok-tts", Alias: "customer-voice", DisplayName: "Voice Alias"}, {Name: "ordinary-upstream", Alias: "ordinary"}}})
+	if len(models) != 2 {
+		t.Fatalf("wrong configured model count: %d", len(models))
+	}
+	speech := models[0]
+	if speech.ID != "customer-voice" || speech.MetadataModelID != "grok-tts" || speech.UpstreamProtocol != registry.UpstreamProtocolXAIVoiceHTTP || speech.AudioSpeech == nil {
+		t.Fatal("explicit speech contract lost across native alias registration")
+	}
+	if models[1].AudioSpeech != nil || models[1].UpstreamProtocol != registry.UpstreamProtocolLegacy {
+		t.Fatal("ordinary configured model inferred speech by provider name")
+	}
+}

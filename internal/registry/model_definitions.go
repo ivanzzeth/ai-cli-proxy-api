@@ -258,7 +258,7 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
 // not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinImage20ModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15ModelInfo(), xaiBuiltinVideo15PreviewModelInfo())
+	return upsertModelInfos(models, xaiBuiltinSpeechModelInfo(), xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinImage20ModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15ModelInfo(), xaiBuiltinVideo15PreviewModelInfo())
 }
 
 func normalizeAntigravityCapabilityModelID(modelID string) string {
@@ -560,4 +560,8 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 	}
 
 	return nil
+}
+
+func xaiBuiltinSpeechModelInfo() *ModelInfo {
+	return &ModelInfo{ID: "grok-tts", Name: "grok-tts", Object: "model", Created: 1793836800, OwnedBy: "xai", Type: "openai-audio-speech", DisplayName: "Grok TTS", Description: "xAI native text-to-speech; existing compatible client protocols retain their own fields.", UpstreamProtocol: UpstreamProtocolXAIVoiceHTTP, AudioSpeech: XAISpeechProfile(), SupportedInputModalities: []string{"text"}, SupportedOutputModalities: []string{"audio"}}
 }

@@ -4,13 +4,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/tidwall/gjson"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -122,6 +128,33 @@ func voiceResponseHeaders(header http.Header) http.Header {
 }
 
 func (e *XAIExecutor) executeVoiceHTTP(ctx context.Context, auth *cliproxyauth.Auth, req native.Request, opts native.Options) (response native.Response, err error) {
+	if opts.NativeVoiceOperation == native.NativeVoiceTTS && strings.TrimSpace(req.Model) == "" {
+		declared := xaiSpeechDeclarationForModel(auth, "")
+		if declared == nil || declared.UpstreamProtocol != registry.UpstreamProtocolXAIVoiceHTTP || declared.AudioSpeech == nil || declared.AudioSpeech.Profile != "xai-grok-tts-v1" {
+			return response, statusErr{code: 400, msg: "native TTS requires a current selected-credential speech declaration"}
+		}
+	}
+	compatibleSpeech := opts.SourceFormat.String() == "openai-speech"
+	expectedMIME := ""
+	if compatibleSpeech {
+		if auth == nil {
+			return response, statusErr{code: 400, msg: "speech credential required"}
+		}
+		if opts.NativeVoiceOperation != native.NativeVoiceTTS || opts.Stream || !opts.SingleAttempt {
+			return response, statusErr{code: 400, msg: "unsupported speech operation"}
+		}
+		info := xaiDeclaredSpeechModel(auth, req.Model)
+		if info == nil || info.UpstreamProtocol != registry.UpstreamProtocolXAIVoiceHTTP || info.AudioSpeech == nil || info.AudioSpeech.Profile != "xai-grok-tts-v1" {
+			return response, statusErr{code: 400, msg: "explicit xAI speech profile required"}
+		}
+		payload, err := openAISpeechToXAI(req.Payload)
+		if err != nil {
+			return response, statusErr{code: 400, msg: err.Error()}
+		}
+		req.Payload = payload
+		expectedMIME = map[string]string{"mp3": "audio/mpeg", "wav": "audio/wav", "pcm": "audio/pcm"}[gjson.GetBytes(payload, "output_format.codec").String()]
+	}
+
 	if len(VoiceHTTPCompatibleOperations(auth, e, true, false)) == 0 {
 		return response, statusErr{code: 400, msg: "credential does not support native Voice HTTP"}
 	}
@@ -226,6 +259,113 @@ func (e *XAIExecutor) executeVoiceHTTP(ctx context.Context, auth *cliproxyauth.A
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 		return response, &voiceHTTPStatusError{status: upstream.StatusCode, body: body, headers: header, classification: xaiStatusErr(upstream.StatusCode, body)}
 	}
+	if compatibleSpeech {
+		actual, _, parseErr := mime.ParseMediaType(header.Get("Content-Type"))
+		if parseErr != nil || actual != expectedMIME || len(body) == 0 {
+			return response, fmt.Errorf("speech_outcome_unknown: requested audio codec mismatch")
+		}
+		header.Set("Content-Type", actual)
+	}
 	reporter.EnsurePublished(ctx)
-	return native.Response{StatusCode: upstream.StatusCode, Payload: body, Headers: header}, nil
+	usageSource := "native_operation_units"
+	if operation.Operation == native.NativeVoiceTTS {
+		usageSource = "request_estimated_characters"
+	}
+	return native.Response{StatusCode: upstream.StatusCode, Payload: body, Headers: header, Metadata: map[string]any{"upstream_protocol": string(registry.UpstreamProtocolXAIVoiceHTTP), "speech_usage_source": usageSource}}, nil
+}
+
+// xaiDeclaredSpeechModel consults only this selected credential's explicit registry
+// declarations. Equal model names on a different credential are unrelated.
+func xaiDeclaredSpeechModel(auth *cliproxyauth.Auth, model string) *registry.ModelInfo {
+	if strings.TrimSpace(model) == "" {
+		return nil
+	}
+	return xaiSpeechDeclarationForModel(auth, model)
+}
+func xaiSpeechDeclarationForModel(auth *cliproxyauth.Auth, model string) *registry.ModelInfo {
+	if auth == nil {
+		return nil
+	}
+	name := thinking.ParseSuffix(model).ModelName
+	var found *registry.ModelInfo
+	for _, info := range registry.GetGlobalRegistry().GetModelsForClient(auth.ID) {
+		if info == nil || (name != "" && info.ID != name && info.MetadataModelID != name) || info.AudioSpeech == nil {
+			continue
+		}
+		if found != nil && (found.UpstreamProtocol != info.UpstreamProtocol || found.AudioSpeech.Profile != info.AudioSpeech.Profile) {
+			return &registry.ModelInfo{UpstreamProtocol: "invalid", AudioSpeech: &registry.AudioSpeechSupport{}}
+		}
+		found = info
+	}
+	return found
+}
+
+// openAISpeechToXAI translates only representable existing fields. Provider selection
+// has already used the selected credential's explicit model declaration above.
+func openAISpeechToXAI(body []byte) ([]byte, error) {
+	if len(body) > 32768 || !utf8.Valid(body) || !gjson.ValidBytes(body) {
+		return nil, fmt.Errorf("invalid bounded speech JSON")
+	}
+	object := gjson.ParseBytes(body)
+	if !object.IsObject() {
+		return nil, fmt.Errorf("speech JSON object required")
+	}
+	fields := map[string]gjson.Result{}
+	var invalid bool
+	object.ForEach(func(k, v gjson.Result) bool {
+		if _, exists := fields[k.String()]; exists {
+			invalid = true
+			return false
+		}
+		fields[k.String()] = v
+		return true
+	})
+	if invalid {
+		return nil, fmt.Errorf("duplicate speech field")
+	}
+	for name := range fields {
+		switch name {
+		case "model", "input", "voice", "response_format", "speed", "instructions", "stream_format":
+		default:
+			return nil, fmt.Errorf("unsupported speech parameter")
+		}
+	}
+	for _, name := range []string{"model", "input", "voice"} {
+		if fields[name].Type != gjson.String || strings.TrimSpace(fields[name].String()) == "" {
+			return nil, fmt.Errorf("speech model,input,voice strings required")
+		}
+	}
+	if utf8.RuneCountInString(fields["input"].String()) > 4096 || len(fields["voice"].String()) > 128 || strings.ContainsAny(fields["voice"].String(), "/\\?# \t\r\n") {
+		return nil, fmt.Errorf("unsupported speech input or native voice ID")
+	}
+	codec := "mp3"
+	if f, ok := fields["response_format"]; ok {
+		if f.Type != gjson.String {
+			return nil, fmt.Errorf("speech format string required")
+		}
+		codec = f.String()
+	}
+	switch codec {
+	case "mp3", "wav", "pcm":
+	default:
+		return nil, fmt.Errorf("unsupported speech format")
+	}
+	speed := 1.0
+	if v, ok := fields["speed"]; ok {
+		if v.Type != gjson.Number || v.Float() < 0.7 || v.Float() > 1.5 {
+			return nil, fmt.Errorf("speech speed outside supported intersection")
+		}
+		speed = v.Float()
+	}
+	if v, ok := fields["instructions"]; ok && (v.Type != gjson.String || v.String() != "") {
+		return nil, fmt.Errorf("speech instructions unsupported")
+	}
+	if v, ok := fields["stream_format"]; ok && (v.Type != gjson.String || v.String() != "audio") {
+		return nil, fmt.Errorf("speech event format unsupported")
+	}
+	output := map[string]any{"codec": codec, "sample_rate": 24000}
+	if codec == "mp3" {
+		output["bit_rate"] = 128000
+	}
+	return json.Marshal(map[string]any{"text": fields["input"].String(), "voice_id": fields["voice"].String(), "language": "auto", "speed": speed, "output_format": output})
 }

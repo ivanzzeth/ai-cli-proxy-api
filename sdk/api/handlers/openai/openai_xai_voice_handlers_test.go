@@ -52,6 +52,8 @@ func TestXAIVoiceMandatoryPinAndNativeCredentialWire(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		registry.GetGlobalRegistry().RegisterClient(id, "xai", []*registry.ModelInfo{{ID: "grok-tts", UpstreamProtocol: registry.UpstreamProtocolXAIVoiceHTTP, AudioSpeech: registry.XAISpeechProfile()}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
 	}
 	handler := openai.NewOpenAIAPIHandler(base.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
 	gin.SetMode(gin.TestMode)
@@ -121,6 +123,8 @@ func TestXAIVoiceNativeErrorBodyHeadersWithoutGenericPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	registry.GetGlobalRegistry().RegisterClient("A", "xai", []*registry.ModelInfo{{ID: "grok-tts", UpstreamProtocol: registry.UpstreamProtocolXAIVoiceHTTP, AudioSpeech: registry.XAISpeechProfile()}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("A") })
 	handler := openai.NewOpenAIAPIHandler(base.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
 	router := gin.New()
 	router.POST("/v1/tts", handler.XAIVoiceHTTP)
@@ -191,5 +195,45 @@ func TestPlanSpeechHandlerRealCompatExecutorPreservesInternalCount(t *testing.T)
 		} else if rec.Code != 200 || rec.Header().Get("X-CLIProxy-Speech-Text-Words") != "2" || rec.Header().Get("Content-Type") != "audio/mpeg" || wires.Load() != 1 {
 			t.Fatalf("status=%d count=%s wires=%d body=%s", rec.Code, rec.Header().Get("X-CLIProxy-Speech-Text-Words"), wires.Load(), rec.Body.String())
 		}
+	}
+}
+
+func TestCompatibleSpeechSelectedXAIWireAndNoFakeWords(t *testing.T) {
+	var wires atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wires.Add(1)
+		data, _ := io.ReadAll(r.Body)
+		if r.URL.Path != "/tts" || !strings.Contains(string(data), `"language":"auto"`) || strings.Contains(string(data), `"model"`) {
+			t.Errorf("wrong translated native wire: %s %s", r.URL.Path, data)
+		}
+		w.Header().Set("Content-Type", "audio/wav")
+		_, _ = io.WriteString(w, "RIFF-native-fixture")
+	}))
+	defer srv.Close()
+	manager := auth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(runtimeexecutor.NewXAIExecutor(nil))
+	credential := &auth.Auth{ID: "speech-handler-A", Provider: "xai", Status: auth.StatusActive, Attributes: map[string]string{"api_key": "fixture", "base_url": srv.URL, "source": "config:xai[fixture]"}}
+	if _, err := manager.Register(context.Background(), credential); err != nil {
+		t.Fatal(err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(credential.ID, "xai", []*registry.ModelInfo{{ID: "customer-tts", MetadataModelID: "grok-tts", UpstreamProtocol: registry.UpstreamProtocolXAIVoiceHTTP, AudioSpeech: registry.XAISpeechProfile()}})
+	defer reg.UnregisterClient(credential.ID)
+	handler := openai.NewOpenAIAPIHandler(base.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	configaccess.Register(&sdkconfig.SDKConfig{APIKeys: []string{"speech-proxy-service"}})
+	defer configaccess.Register(nil)
+	access := sdkaccess.NewManager()
+	access.SetProviders(sdkaccess.RegisteredProviders())
+	router.POST("/v1/audio/speech", api.AuthMiddleware(access), handler.AudioSpeech)
+	request := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(`{"model":"customer-tts","input":"hello","voice":"eve","response_format":"wav"}`))
+	request.Header.Set("Authorization", "Bearer speech-proxy-service")
+	request.Header.Set("X-CLIProxy-Auth-ID", credential.ID)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != 200 || response.Body.String() != "RIFF-native-fixture" || response.Header().Get("Content-Type") != "audio/wav" || response.Header().Get("X-CLIProxy-Speech-Text-Words") != "" || response.Header().Get("X-Audio-Text-Words") != "" || wires.Load() != 1 {
+		t.Fatalf("compatible speech lost native boundary: status=%d headers=%v wires=%d", response.Code, response.Header(), wires.Load())
 	}
 }

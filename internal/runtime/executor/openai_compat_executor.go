@@ -144,6 +144,10 @@ func (e *OpenAICompatExecutor) executeCompatible(ctx context.Context, auth *clip
 		}
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
 	}
+	translated, err = e.normalizeArkToolSchemas(auth, baseModel, translated, endpoint == "/chat/completions")
+	if err != nil {
+		return resp, err
+	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -388,6 +392,11 @@ func (e *OpenAICompatExecutor) executeCompatibleStream(ctx context.Context, auth
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	translated, err = e.normalizeArkToolSchemas(auth, baseModel, translated, true)
+	if err != nil {
+		return nil, err
 	}
 
 	// Request usage data in the final streaming chunk so that token statistics

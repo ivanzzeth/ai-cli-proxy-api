@@ -23,8 +23,13 @@ import (
 	native "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-func voiceFixtureAuth(base string) *auth.Auth {
-	return &auth.Auth{ID: "native-A", Provider: "xai", Status: auth.StatusActive, Attributes: map[string]string{"api_key": "fixture-secret", "base_url": base, "source": "config:xai[opaque]", "header:X-CLIProxy-Auth-ID": "must-strip"}}
+func voiceFixtureAuth(t *testing.T, base string) *auth.Auth {
+	t.Helper()
+	credential := &auth.Auth{ID: "native-A", Provider: "xai", Status: auth.StatusActive, Attributes: map[string]string{"api_key": "fixture-secret", "base_url": base, "source": "config:xai[opaque]", "header:X-CLIProxy-Auth-ID": "must-strip"}}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(credential.ID, "xai", []*registry.ModelInfo{{ID: "grok-tts", UpstreamProtocol: registry.UpstreamProtocolXAIVoiceHTTP, AudioSpeech: registry.XAISpeechProfile()}})
+	t.Cleanup(func() { reg.UnregisterClient(credential.ID) })
+	return credential
 }
 func voiceFixtureOptions(operation native.NativeVoiceHTTPOperation) native.Options {
 	return native.Options{NativeVoiceOperation: operation, SingleAttempt: operation.Unsafe(), Headers: http.Header{"Content-Type": []string{"multipart/form-data; boundary=fixture"}, native.NativeVoiceAuthIDHeader: []string{"inbound-pin"}}, Query: url.Values{"_native_voice_id": []string{"voice-one"}}}
@@ -46,7 +51,7 @@ func TestVoiceHTTPCommittedDisconnectActualWireOnce(t *testing.T) {
 					}
 				}))
 				defer srv.Close()
-				_, err := NewXAIExecutor(nil).Execute(context.Background(), voiceFixtureAuth(srv.URL), native.Request{Payload: []byte(body)}, voiceFixtureOptions(op))
+				_, err := NewXAIExecutor(nil).Execute(context.Background(), voiceFixtureAuth(t, srv.URL), native.Request{Payload: []byte(body)}, voiceFixtureOptions(op))
 				if err == nil || wires.Load() != 1 {
 					t.Fatalf("err=%v actual wires=%d", err, wires.Load())
 				}
@@ -79,7 +84,7 @@ func TestVoiceHTTPRedirectAndSuccessStatus(t *testing.T) {
 				}
 			}))
 			defer srv.Close()
-			response, err := NewXAIExecutor(nil).Execute(context.Background(), voiceFixtureAuth(srv.URL), native.Request{Payload: []byte("--fixture")}, voiceFixtureOptions(native.NativeVoiceTTS))
+			response, err := NewXAIExecutor(nil).Execute(context.Background(), voiceFixtureAuth(t, srv.URL), native.Request{Payload: []byte("--fixture")}, voiceFixtureOptions(native.NativeVoiceTTS))
 			if origin.Load() != 1 || target.Load() != 0 {
 				t.Fatalf("wire origin=%d redirect=%d", origin.Load(), target.Load())
 			}
@@ -107,13 +112,13 @@ func TestVoiceHTTPIdempotencyAndKindsFailBeforeWire(t *testing.T) {
 		for _, value := range []string{"", "opaque"} {
 			opts := voiceFixtureOptions(native.NativeVoiceDelete)
 			opts.Headers[header] = []string{value}
-			_, err := NewXAIExecutor(nil).Execute(context.Background(), voiceFixtureAuth(srv.URL), native.Request{}, opts)
+			_, err := NewXAIExecutor(nil).Execute(context.Background(), voiceFixtureAuth(t, srv.URL), native.Request{}, opts)
 			if err == nil {
 				t.Fatal("idempotency presence accepted")
 			}
 		}
 	}
-	base := voiceFixtureAuth(srv.URL)
+	base := voiceFixtureAuth(t, srv.URL)
 	for _, variant := range []string{"oauth", "compat", "disabled", "status-disabled", "home", "unknown-executor"} {
 		candidate := base.Clone()
 		var executor auth.ProviderExecutor = NewXAIExecutor(nil)
@@ -151,12 +156,12 @@ func TestVoiceHTTPHTTP1TLSAndUnknownTransport(t *testing.T) {
 	srv.StartTLS()
 	defer srv.Close()
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", srv.Client().Transport)
-	response, err := NewXAIExecutor(nil).Execute(ctx, voiceFixtureAuth(srv.URL), native.Request{}, voiceFixtureOptions(native.NativeVoiceTTS))
+	response, err := NewXAIExecutor(nil).Execute(ctx, voiceFixtureAuth(t, srv.URL), native.Request{}, voiceFixtureOptions(native.NativeVoiceTTS))
 	if err != nil || response.StatusCode != 200 || protocol.Load() != 1 {
 		t.Fatalf("HTTP/1 contract err=%v proto=%d", err, protocol.Load())
 	}
 	unknown := context.WithValue(context.Background(), "cliproxy.roundtripper", voiceUnknownTransport{})
-	_, err = NewXAIExecutor(nil).Execute(unknown, voiceFixtureAuth(srv.URL), native.Request{}, voiceFixtureOptions(native.NativeVoiceList))
+	_, err = NewXAIExecutor(nil).Execute(unknown, voiceFixtureAuth(t, srv.URL), native.Request{}, voiceFixtureOptions(native.NativeVoiceList))
 	if err == nil {
 		t.Fatal("unknown transport accepted")
 	}
@@ -187,7 +192,7 @@ func TestVoiceHTTPBoundsAndUnknownOperationBeforeWire(t *testing.T) {
 	}))
 	defer srv.Close()
 	executor := NewXAIExecutor(nil)
-	credential := voiceFixtureAuth(srv.URL)
+	credential := voiceFixtureAuth(t, srv.URL)
 	opts := voiceFixtureOptions(native.NativeVoiceHTTPOperation("unknown"))
 	if _, err := executor.Execute(context.Background(), credential, native.Request{}, opts); err == nil {
 		t.Fatal("unknown operation accepted")
@@ -240,7 +245,7 @@ func TestVoiceGETRedirectNeverReachesSourceB(t *testing.T) {
 					}
 					defer transport.CloseIdleConnections()
 					ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", transport)
-					credential := voiceFixtureAuth("http://source-a.test")
+					credential := voiceFixtureAuth(t, "http://source-a.test")
 					credential.Attributes["header:X-Custom-Credential"] = "fixture-A"
 					credential.Attributes["header:x-CLIPROXY-auth-ID"] = "server-A"
 					response, err := NewXAIExecutor(nil).Execute(ctx, credential, native.Request{}, voiceFixtureOptions(operation))
@@ -278,7 +283,7 @@ func TestVoiceGETNativeManagerRetriesSelectedSource(t *testing.T) {
 	manager.RegisterExecutor(NewXAIExecutor(nil))
 	manager.SetRetryConfig(1, 0, 2)
 	for _, id := range []string{"voice-get-A", "voice-get-B"} {
-		credential := voiceFixtureAuth(server.URL)
+		credential := voiceFixtureAuth(t, server.URL)
 		credential.ID = id
 		credential.Metadata = map[string]any{"request_retry": 1, "disable_cooling": true}
 		if id == "voice-get-B" {
@@ -335,7 +340,7 @@ func TestVoiceGETResponseBodyClosedOnBoundFailure(t *testing.T) {
 	defer transport.CloseIdleConnections()
 	defaultClient, defaultTransport := http.DefaultClient, http.DefaultTransport
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", transport)
-	response, err := NewXAIExecutor(nil).Execute(ctx, voiceFixtureAuth(server.URL), native.Request{}, voiceFixtureOptions(native.NativeVoiceList))
+	response, err := NewXAIExecutor(nil).Execute(ctx, voiceFixtureAuth(t, server.URL), native.Request{}, voiceFixtureOptions(native.NativeVoiceList))
 	if err == nil || response.StatusCode != 0 || wires.Load() != 1 || closed.Load() != 1 {
 		t.Fatalf("GET body cleanup: err=%v success=%d wires=%d closed=%d", err, response.StatusCode, wires.Load(), closed.Load())
 	}
@@ -494,5 +499,114 @@ func TestVolcengineProtocolIdentityIsExplicitAndSuffixAware(t *testing.T) {
 	cfg.OpenAICompatibility[0].Models[1].UpstreamProtocol = ""
 	if _, err := e.configuredUpstreamProtocol(credential, "doubao-seed-tts-2.0"); err == nil {
 		t.Fatal("speech_profile was allowed to select wire protocol")
+	}
+}
+
+func TestOpenAISpeechXAIExactFieldIntersection(t *testing.T) {
+	for _, codec := range []string{"mp3", "wav", "pcm"} {
+		payload, err := openAISpeechToXAI([]byte(`{"model":"customer-tts","input":"你好！","voice":"eve","response_format":"` + codec + `","speed":1.2}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]any
+		if err = json.Unmarshal(payload, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if fields["text"] != "你好！" || fields["voice_id"] != "eve" || fields["language"] != "auto" || fields["model"] != nil || fields["speed"] != 1.2 {
+			t.Fatalf("lossy or invented translation: %s", payload)
+		}
+		output := fields["output_format"].(map[string]any)
+		if output["codec"] != codec || output["sample_rate"] != float64(24000) {
+			t.Fatalf("wrong output contract: %s", payload)
+		}
+	}
+	for _, extra := range []string{`,"speed":"1"`, `,"speed":null`, `,"speed":0.5`, `,"speed":2`, `,"instructions":"whisper"`, `,"stream_format":"sse"`, `,"response_format":"opus"`, `,"voice":{"id":"voice_custom"}`, `,"input":"duplicate"`} {
+		if _, err := openAISpeechToXAI([]byte(`{"model":"grok-tts","input":"hello","voice":"eve"` + extra + `}`)); err == nil {
+			t.Fatalf("unrepresentable field accepted: %s", extra)
+		}
+	}
+	for _, body := range []string{`{"model":"grok-tts","input":"hello","voice":{"id":"eve"}}`, `{"model":"grok-tts","input":7,"voice":"eve"}`, `{"model":false,"input":"hello","voice":"eve"}`} {
+		if _, err := openAISpeechToXAI([]byte(body)); err == nil {
+			t.Fatalf("unsupported actual JSON field type accepted: %s", body)
+		}
+	}
+}
+
+func TestXAIDeclaredAudioModelCannotReachTextOrWrongCodec(t *testing.T) {
+	var wires atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wires.Add(1)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		_, _ = io.WriteString(w, "ID3-fixture")
+	}))
+	defer srv.Close()
+	credential := &auth.Auth{ID: "speech-scope-A", Provider: "xai", Status: auth.StatusActive, Attributes: map[string]string{"api_key": "fixture", "base_url": srv.URL, "source": "config:xai[fixture]"}}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(credential.ID, "xai", []*registry.ModelInfo{{ID: "source-A/native-tts-alias", MetadataModelID: "grok-tts", UpstreamProtocol: registry.UpstreamProtocolXAIVoiceHTTP, AudioSpeech: registry.XAISpeechProfile()}})
+	defer reg.UnregisterClient(credential.ID)
+	executor := NewXAIExecutor(nil)
+	for _, model := range []string{"source-A/native-tts-alias", "grok-tts", "source-A/native-tts-alias(high)"} {
+		if _, err := executor.Execute(context.Background(), credential, native.Request{Model: model, Payload: []byte(`{"messages":[]}`)}, native.Options{}); err == nil {
+			t.Fatal("audio model accepted text execution")
+		}
+		if _, err := executor.ExecuteStream(context.Background(), credential, native.Request{Model: model, Payload: []byte(`{"input":"hello"}`)}, native.Options{}); err == nil {
+			t.Fatal("audio model accepted text streaming")
+		}
+	}
+	if wires.Load() != 0 {
+		t.Fatal("unsupported operation reached supplier")
+	}
+	other := &auth.Auth{ID: "same-name-text-B", Provider: "xai"}
+	reg.RegisterClient(other.ID, "xai", []*registry.ModelInfo{{ID: "customer-tts"}})
+	defer reg.UnregisterClient(other.ID)
+	if xaiDeclaredSpeechModel(other, "customer-tts") != nil {
+		t.Fatal("global same-name declaration contaminated text credential")
+	}
+	_, err := executor.Execute(context.Background(), credential, native.Request{Model: "source-A/native-tts-alias", Payload: []byte(`{"model":"customer-tts","input":"hello","voice":"eve","response_format":"pcm"}`)}, native.Options{SourceFormat: sdktranslator.FromString("openai-speech"), NativeVoiceOperation: native.NativeVoiceTTS, SingleAttempt: true, Headers: http.Header{"Content-Type": []string{"application/json"}}})
+	if err == nil || wires.Load() != 1 {
+		t.Fatalf("codec mismatch must be one unknown outcome: err=%v wires=%d", err, wires.Load())
+	}
+}
+
+func TestNativeModelLessTTSRequiresCurrentSelectedCredentialDeclaration(t *testing.T) {
+	var wires atomic.Int32
+	original := `{"text":"hello","voice_id":"eve","language":"auto","output_format":{"codec":"alaw","sample_rate":8000},"text_normalization":true}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wires.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		if string(body) != original {
+			t.Error("original native TTS extensions changed")
+		}
+		w.Header().Set("Content-Type", "audio/basic")
+		_, _ = io.WriteString(w, "native-audio")
+	}))
+	defer srv.Close()
+	credential := &auth.Auth{ID: "model-less-native-TTS", Provider: "xai", Status: auth.StatusActive, Attributes: map[string]string{"api_key": "fixture", "base_url": srv.URL, "source": "config:xai[fixture]"}}
+	executor := NewXAIExecutor(nil)
+	reg := registry.GetGlobalRegistry()
+	defer reg.UnregisterClient(credential.ID)
+	invoke := func() error {
+		_, err := executor.Execute(context.Background(), credential, native.Request{Payload: []byte(original)}, native.Options{NativeVoiceOperation: native.NativeVoiceTTS, SingleAttempt: true, SourceFormat: sdktranslator.FromString("xai-voice-http"), Headers: http.Header{"Content-Type": []string{"application/json"}}})
+		return err
+	}
+	if invoke() == nil || wires.Load() != 0 {
+		t.Fatal("undeclared model-less TTS reached provider")
+	}
+	reg.RegisterClient(credential.ID, "xai", []*registry.ModelInfo{{ID: "alias-one", MetadataModelID: "grok-tts", UpstreamProtocol: registry.UpstreamProtocolXAIVoiceHTTP, AudioSpeech: registry.XAISpeechProfile()}, {ID: "alias-two", MetadataModelID: "grok-tts", UpstreamProtocol: registry.UpstreamProtocolXAIVoiceHTTP, AudioSpeech: registry.XAISpeechProfile()}})
+	if err := invoke(); err != nil || wires.Load() != 1 {
+		t.Fatalf("equivalent actual aliases rejected: err=%v count=%d", err, wires.Load())
+	}
+	reg.RegisterClient(credential.ID, "xai", []*registry.ModelInfo{{ID: "text-only"}})
+	if invoke() == nil || wires.Load() != 1 {
+		t.Fatal("stale/excluded TTS registration reached provider")
+	}
+	other := registry.XAISpeechProfile()
+	other.Profile = "unproved-other-profile"
+	reg.RegisterClient(credential.ID, "xai", []*registry.ModelInfo{{ID: "alias-one", UpstreamProtocol: registry.UpstreamProtocolXAIVoiceHTTP, AudioSpeech: registry.XAISpeechProfile()}, {ID: "different", UpstreamProtocol: registry.UpstreamProtocolXAIVoiceHTTP, AudioSpeech: other}})
+	if invoke() == nil || wires.Load() != 1 {
+		t.Fatal("ambiguous native TTS profile reached provider")
+	}
+	if xaiDeclaredSpeechModel(credential, "") != nil {
+		t.Fatal("model-less TTS fold contaminated non-TTS legacy lookup")
 	}
 }
