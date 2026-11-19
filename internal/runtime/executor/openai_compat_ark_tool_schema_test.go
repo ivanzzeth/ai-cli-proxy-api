@@ -228,3 +228,85 @@ func TestOpenAICompatArkToolSchemaLegacyByteIdentity(t *testing.T) {
 		t.Fatal("undeclared Ark inferred from URL or schema")
 	}
 }
+
+func TestArkToolSchemaReviewEscapedRef(t *testing.T) {
+	executor, credential := arkWireExecutor("https://not-called.invalid", registry.UpstreamProtocolVolcengineArkTextV3)
+	payload := arkWirePayload("openai", `{"type":"object","$defs":{"x":{"type":"string"}},"properties":{"x":{"$\u0072ef":"#/$defs/x"}}}`, false)
+	got, err := executor.normalizeArkToolSchemas(credential, "upstream-model", payload, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "tools.0.function.parameters.properties.x.$ref").Exists() {
+		t.Fatalf("escaped schema ref left on wire: %s", got)
+	}
+}
+
+func TestOpenAICompatArkEscapedReferences(t *testing.T) {
+	for _, format := range []translator.Format{translator.FormatOpenAI, translator.FormatOpenAIResponse, translator.FormatClaude} {
+		for _, stream := range []bool{false, true} {
+			for _, key := range []string{`$\u0072ef`, `\u0024ref`, `\u0024\u0072\u0065\u0066`} {
+				t.Run(fmt.Sprintf("%s/stream=%t/key=%s", format, stream, key), func(t *testing.T) {
+					var observed []byte
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						observed, _ = io.ReadAll(r.Body)
+						arkWireResponse(w, stream)
+					}))
+					defer server.Close()
+					executor, credential := arkWireExecutor(server.URL, registry.UpstreamProtocolVolcengineArkTextV3)
+					schema := fmt.Sprintf(`{"type":"object","$defs":{"x":{"type":"string"}},"properties":{"x":{"%s":"#/$defs/x"}}}`, key)
+					payload := arkWirePayload(format, schema, stream)
+					canonical := bytes.Clone(payload)
+					req := native.Request{Model: "upstream-model", Payload: payload}
+					opts := native.Options{SourceFormat: format, OriginalRequest: payload, Stream: stream}
+					if stream {
+						result, err := executor.ExecuteStream(context.Background(), credential, req, opts)
+						if err != nil {
+							t.Fatal(err)
+						}
+						for chunk := range result.Chunks {
+							if chunk.Err != nil {
+								t.Fatal(chunk.Err)
+							}
+						}
+					} else {
+						if _, err := executor.Execute(context.Background(), credential, req, opts); err != nil {
+							t.Fatal(err)
+						}
+					}
+					params := gjson.GetBytes(observed, "tools.0.function.parameters")
+					if params.Get("properties.x.$ref").Exists() || params.Get("properties.x.type").String() != "string" {
+						t.Fatalf("escaped reference not adapted: %s", params.Raw)
+					}
+					if !bytes.Equal(payload, canonical) {
+						t.Fatal("canonical escaped input changed")
+					}
+				})
+			}
+		}
+	}
+}
+func TestOpenAICompatArkEscapedInvalidReferencesBeforeHTTP(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, schema := range []string{`{"$\u0072ef":"#"}`, `{"\u0024ref":"https://example.invalid/never-fetch"}`, `{"$dynamicAnchor":"x","$d\u0079namicRef":"#x"}`, `{"$schema":"https://json-schema.org/draft/2019-09/schema","$recursiveAnchor":true,"$rec\u0075rsiveRef":"#"}`} {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, schema), func(t *testing.T) {
+				var calls atomic.Int32
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); arkWireResponse(w, stream) }))
+				defer server.Close()
+				executor, credential := arkWireExecutor(server.URL, registry.UpstreamProtocolVolcengineArkTextV3)
+				payload := arkWirePayload(translator.FormatOpenAI, schema, stream)
+				req := native.Request{Model: "upstream-model", Payload: payload}
+				opts := native.Options{SourceFormat: translator.FormatOpenAI, OriginalRequest: payload, Stream: stream}
+				var err error
+				if stream {
+					_, err = executor.ExecuteStream(context.Background(), credential, req, opts)
+				} else {
+					_, err = executor.Execute(context.Background(), credential, req, opts)
+				}
+				status, ok := err.(interface{ StatusCode() int })
+				if !ok || status.StatusCode() != 400 || calls.Load() != 0 {
+					t.Fatalf("escaped invalid schema escaped typed-400/zero-HTTP guard: %v calls=%d", err, calls.Load())
+				}
+			})
+		}
+	}
+}

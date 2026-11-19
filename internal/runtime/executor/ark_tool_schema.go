@@ -97,12 +97,13 @@ func inlineArkSchema(raw any) (any, error) {
 					}
 				}
 			case reflect.Map:
-				if v.Type().Elem() == reflect.TypeOf((*js.Schema)(nil)) {
-					it := v.MapRange()
-					for it.Next() {
-						if err := visit(it.Value()); err != nil {
-							return err
-						}
+				// Dependencies contains either a *Schema or a property-name
+				// []string behind interface values. The compiler has already
+				// distinguished these; visit only typed schema occurrences.
+				it := v.MapRange()
+				for it.Next() {
+					if err := visit(it.Value()); err != nil {
+						return err
 					}
 				}
 			}
@@ -147,10 +148,8 @@ func (x *arkSchemaInliner) rawAt(s *js.Schema) (any, error) {
 	return v, err
 }
 func (x *arkSchemaInliner) expand(s *js.Schema, active map[*js.Schema]bool, depth int) (any, error) {
-	x.remaining--
-	x.remainingBytes -= 32
-	if x.remaining < 0 || x.remainingBytes < 0 || depth > arkSchemaMaxDepth {
-		return nil, fmt.Errorf("expansion budget")
+	if err := x.chargeNode(nil, depth); err != nil {
+		return nil, err
 	}
 	if active[s] {
 		return nil, fmt.Errorf("cyclic reference")
@@ -179,22 +178,15 @@ func (x *arkSchemaInliner) expand(s *js.Schema, active map[*js.Schema]bool, dept
 		if key == "$ref" || key == "$defs" || key == "definitions" || key == "$anchor" {
 			continue
 		}
+		if err := x.chargeKey(key); err != nil {
+			return nil, err
+		}
 		// An instance can also be a reference target. Its original annotation
 		// occurrence remains data even when the compiler graph compiles that
 		// location as a target schema for a different occurrence.
 		if key == "default" || key == "examples" || key == "enum" || key == "const" {
-			nodes := 0
-			if err := arkSchemaInputBudget(v, depth+1, &nodes); err != nil {
+			if err := x.chargeOpaque(v, depth+1); err != nil {
 				return nil, err
-			}
-			encoded, err := json.Marshal(v)
-			if err != nil {
-				return nil, err
-			}
-			x.remaining -= nodes
-			x.remainingBytes -= len(encoded)
-			if x.remaining < 0 || x.remainingBytes < 0 {
-				return nil, fmt.Errorf("expansion budget")
 			}
 			out[key] = v
 			continue
@@ -264,13 +256,8 @@ func (x *arkSchemaInliner) expand(s *js.Schema, active map[*js.Schema]bool, dept
 	return result, nil
 }
 func (x *arkSchemaInliner) container(v any, loc string, children map[string]*js.Schema, active map[*js.Schema]bool, depth int) (any, error) {
-	x.remaining--
-	x.remainingBytes -= 32
-	if text, ok := v.(string); ok {
-		x.remainingBytes -= len(text)
-	}
-	if x.remaining < 0 || x.remainingBytes < 0 || depth > arkSchemaMaxDepth {
-		return nil, fmt.Errorf("expansion budget")
+	if err := x.chargeNode(v, depth); err != nil {
+		return nil, err
 	}
 
 	if s, ok := children[loc]; ok {
@@ -280,6 +267,9 @@ func (x *arkSchemaInliner) container(v any, loc string, children map[string]*js.
 	case map[string]any:
 		out := map[string]any{}
 		for k, v := range a {
+			if err := x.chargeKey(k); err != nil {
+				return nil, err
+			}
 			n, e := x.container(v, loc+"/"+jsonpointer.Escape(k), children, active, depth+1)
 			if e != nil {
 				return nil, e
@@ -326,9 +316,7 @@ func (e *OpenAICompatExecutor) normalizeArkToolSchemas(auth *cliproxyauth.Auth, 
 			continue
 		}
 		raw := []byte(schema.Raw)
-		if !bytes.Contains(raw, []byte(`"$ref"`)) && !bytes.Contains(raw, []byte(`"$dynamicRef"`)) && !bytes.Contains(raw, []byte(`"$recursiveRef"`)) {
-			continue
-		}
+
 		toolName := tool.Get("function.name").String()
 		if len(toolName) > 128 {
 			toolName = toolName[:128]
@@ -344,6 +332,14 @@ func (e *OpenAICompatExecutor) normalizeArkToolSchemas(auth *cliproxyauth.Auth, 
 		var input any
 		if decoder.Decode(&input) != nil {
 			return fail()
+		}
+		if arkSchemaInputBudget(input, 0, new(int)) != nil {
+			return fail()
+		}
+		// Inspect decoded keys. JSON escapes can encode any part of "$ref";
+		// literal byte matching cannot decide whether a schema has references.
+		if !arkSchemaPotentialRefs(input) {
+			continue
 		}
 		output, errInline := inlineArkSchema(input)
 		if errInline != nil {
@@ -389,4 +385,86 @@ func arkSchemaInputBudget(v any, depth int, nodes *int) error {
 		}
 	}
 	return nil
+}
+
+// chargeNode reserves structural separators and the widest scalar representation
+// before allocating an output container. A UTF-8 byte needs at most six bytes in
+// encoding/json's escaped JSON string representation, including HTML escaping.
+// This deliberately conservative bound never allocates an encoded buffer.
+func (x *arkSchemaInliner) chargeNode(v any, depth int) error {
+	x.remaining--
+	x.remainingBytes -= 64
+	if x.remaining < 0 || x.remainingBytes < 0 || depth > arkSchemaMaxDepth {
+		return fmt.Errorf("expansion budget")
+	}
+	switch value := v.(type) {
+	case string:
+		return x.chargeString(value)
+	case json.Number:
+		if len(value) > x.remainingBytes {
+			return fmt.Errorf("expansion budget")
+		}
+		x.remainingBytes -= len(value)
+	}
+	return nil
+}
+func (x *arkSchemaInliner) chargeString(value string) error {
+	if x.remainingBytes < 2 || len(value) > (x.remainingBytes-2)/6 {
+		return fmt.Errorf("expansion budget")
+	}
+	x.remainingBytes -= 2 + 6*len(value)
+	return nil
+}
+func (x *arkSchemaInliner) chargeKey(key string) error {
+	if err := x.chargeString(key); err != nil {
+		return err
+	}
+	x.remainingBytes -= 2 // colon and comma, including a conservative final comma
+	if x.remainingBytes < 0 {
+		return fmt.Errorf("expansion budget")
+	}
+	return nil
+}
+func (x *arkSchemaInliner) chargeOpaque(v any, depth int) error {
+	if err := x.chargeNode(v, depth); err != nil {
+		return err
+	}
+	switch value := v.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if err := x.chargeKey(key); err != nil {
+				return err
+			}
+			if err := x.chargeOpaque(child, depth+1); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if err := x.chargeOpaque(child, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// This is a conservative parsed-JSON prefilter, not schema discovery: instance
+// values may produce a false positive, which the compiler graph safely ignores.
+func arkSchemaPotentialRefs(v any) bool {
+	switch value := v.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if key == "$ref" || key == "$dynamicRef" || key == "$recursiveRef" || arkSchemaPotentialRefs(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if arkSchemaPotentialRefs(child) {
+				return true
+			}
+		}
+	}
+	return false
 }
